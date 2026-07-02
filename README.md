@@ -1,2 +1,2 @@
 # stock-scanner
-stock-scanner-ver.YF
+stock-scanner-ver.FUBON
