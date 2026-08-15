@@ -1,4 +1,5 @@
-streamlit
+starlette==0.39.2
+streamlit>=1.40.0
 yfinance
 pandas
 requests
@@ -6,3 +7,5 @@ urllib3
 streamlit-autorefresh
 fubon_neo-2.2.8-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 openpyxl
+plotly
+
