@@ -10,7 +10,7 @@
 """
 from .base import SignalContext, SignalResult, register_signal
 
-WINDOW = 2            # 檢查跳空向上的觀察視窗天數 (含掃描日)
+WINDOW = 1            # 檢查跳空向上的觀察視窗天數 (含掃描日)
 REQUIRED_GAPS = 1      # 視窗內至少需出現幾根跳空向上K線，才算單跳空
 
 
