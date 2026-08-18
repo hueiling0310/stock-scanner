@@ -56,7 +56,7 @@ jobs:
       - name: Push DB to henglunlin-stock-monitor-FUBAN + precompute trendline levels
         env:
           TARGET_REPO_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
-          TARGET_REPO: "henglunlin/henglunlin-stock-monitor-FUBAN" 
+          TARGET_REPO: "hueiling0310/stock-monitor-FUBON" 
           TARGET_BRANCH: "main" # 若該專案的預設分支是 master，請改成 master
           # precompute_trendlines.py 需要這兩個才能推播 Telegram 通知，跟上面「Run update script」用同一組
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
