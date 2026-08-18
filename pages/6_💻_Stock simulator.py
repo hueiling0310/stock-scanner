@@ -510,6 +510,11 @@ def save_to_database(db_path: str, df: pd.DataFrame):
     with sqlite3.connect(db_path, timeout=30.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         db_utils.ensure_indexes(conn)  # 確保 (SecurityCode, Date) 索引存在，下面的刪除/查詢才吃得到索引
+        # 2026-08-17 修正：journal_mode=WAL 是記錄在 .db 檔案本身、跨連線持續生效的設定，
+        # 這個檔案之後會被提交進 git repo，但 WAL 模式需要的 -wal/-shm side-car 檔案不會
+        # 一起被提交，導致 Streamlit Cloud 之後重新打開這個檔案時可能整個讀取失敗
+        # （這次「pandas.errors.DatabaseError」的根因）。寫入完成後主動切回 DELETE 模式，
+        # 避免把 WAL 模式留在被提交的 db 檔案裡；寫入當下仍保留 WAL 以避免鎖定問題。
 
         # 效能備註 (2026-08-12)：原本用 executemany 對「每一列」各發一條
         # DELETE ... WHERE Date=? AND SecurityCode=?，全市場更新時等於逐檔
@@ -532,6 +537,9 @@ def save_to_database(db_path: str, df: pd.DataFrame):
 
         # 寫入新資料
         df.to_sql("ohlcv_data", conn, if_exists="append", index=False)
+        conn.commit()
+        conn.execute("PRAGMA journal_mode=DELETE;")
+        conn.commit()
 
 
 # --------------------------------------------------------------------------
