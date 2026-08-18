@@ -4,6 +4,15 @@ signals/context.py
 共用基礎數值計算 (價格 / 漲跌% / MA位置 / MA排列 / 成交量 / 波動率 / RS)。
 訊號本身的判斷已全部移交給 signal_module/ 底下可編輯的訊號模組，
 這裡只保留主程式表格與評分共用、跟「訊號判斷」無關的基礎欄位。
+
+2026-08-16 新增：個股 vs 大盤（發行量加權股價指數）強弱比較，共 5 輪確認後定案：
+  - 大盤MA位置 / 大盤MA排列：跟個股完全同一套分類邏輯 (build_base_context)，
+    只是 df 換成大盤歷史資料，並排顯示方便肉眼比對，不額外做數字運算。
+  - RS超額報酬%：跟個股 RS加權報酬% 用同一套「4週加權」公式算出大盤自己的
+    RS加權報酬%，直接相減 (個股 - 大盤)，正值代表比大盤強。
+  - RS Rating：由呼叫端 (主程式) 在單次掃描全市場跑完後，對所有股票的
+    RS超額報酬% 做百分位排名 (0~100)，不是這裡算的單股數值，故不在本檔案。
+  - RS Line 創新高：個股收盤/大盤收盤 的比值序列，是否處於近 N 個交易日新高。
 """
 import pandas as pd
 
@@ -180,3 +189,129 @@ def build_base_context(df: pd.DataFrame, price) -> dict:
         "latest_volume": latest_volume, "volume_lots": volume_lots,
         "volatility_pct": volatility_pct, "rs_raw": rs_raw,
     }
+
+
+def calc_rs_line_new_high(stock_df: pd.DataFrame, price_val, benchmark_df: pd.DataFrame, lookback: int = 60):
+    """
+    計算「RS Line 創新高」旗標。
+    RS Line = 個股收盤 ÷ 大盤收盤（逐日比值），經典的相對強度型態判斷：
+    即使股價還沒創新高，只要這條比值線比大盤還早創新高，通常代表提前吸籌、
+    有機會領漲。這裡判斷「今天」是否處於近 lookback 個交易日的新高（含今天）。
+
+    stock_df / benchmark_df 皆需含 Date, Close 欄位（Date 需能被 to_datetime 解析）。
+    兩邊用 Date 對齊 (inner join)，對齊後資料筆數不足 lookback 時回傳 None
+    （無法判斷，不當作「否」，避免掃描器把「資料不足」誤顯示成「未創新高」）。
+    回傳 True / False / None。
+    """
+    if stock_df is None or benchmark_df is None or stock_df.empty or benchmark_df.empty:
+        return None
+    if "Date" not in stock_df.columns or "Date" not in benchmark_df.columns:
+        return None
+
+    s = stock_df[["Date", "Close"]].copy()
+    s["Date"] = pd.to_datetime(s["Date"], errors="coerce")
+    s = s.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+    if s.empty:
+        return None
+    # 用即時價覆蓋最後一筆收盤價，貼近盤中即時狀態 (跟 calc_rs_raw_value 邏輯一致)
+    s.loc[s.index[-1], "Close"] = float(price_val)
+
+    b = benchmark_df[["Date", "Close"]].copy()
+    b["Date"] = pd.to_datetime(b["Date"], errors="coerce")
+    b = b.dropna(subset=["Date"]).sort_values("Date").rename(columns={"Close": "BenchClose"})
+
+    merged = pd.merge(s, b, on="Date", how="inner")
+    merged["Close"] = pd.to_numeric(merged["Close"], errors="coerce")
+    merged["BenchClose"] = pd.to_numeric(merged["BenchClose"], errors="coerce")
+    merged = merged.dropna(subset=["Close", "BenchClose"])
+    merged = merged[merged["BenchClose"] != 0]
+    if len(merged) < lookback:
+        return None
+
+    merged["RSLine"] = merged["Close"] / merged["BenchClose"]
+    window = merged["RSLine"].tail(lookback)
+    latest = window.iloc[-1]
+    window_max = window.max()
+    if pd.isna(latest) or pd.isna(window_max):
+        return None
+    # 用極小容忍值處理浮點誤差，「打平前高」也算創新高
+    return bool(latest >= window_max - 1e-9)
+
+
+def build_relative_strength_fields(base: dict, benchmark_ctx: dict) -> dict:
+    """
+    給定個股的 base (build_base_context 回傳) 與大盤的 benchmark_ctx
+    (同樣用 build_base_context 對大盤歷史資料算出來的字典，全市場掃描只需算一次、
+    全部股票共用比對，不逐股重算)，組出「個股 vs 大盤」的比較欄位。
+    benchmark_ctx 為 None（例如大盤資料當次抓取失敗）時，全部回傳 "-"，
+    不影響掃描器其餘既有欄位與流程。
+    """
+    if not benchmark_ctx:
+        return {
+            "benchmark_ma_range": "-",
+            "benchmark_ma_trend": "-",
+            "rs_excess": None,
+        }
+
+    rs_excess = None
+    stock_rs = base.get("rs_raw")
+    bench_rs = benchmark_ctx.get("rs_raw")
+    if stock_rs is not None and bench_rs is not None:
+        rs_excess = float(stock_rs) - float(bench_rs)
+
+    return {
+        "benchmark_ma_range": benchmark_ctx.get("ma_range", "-"),
+        "benchmark_ma_trend": benchmark_ctx.get("ma_trend", "-"),
+        "rs_excess": rs_excess,
+    }
+
+
+_TREND_RANK = {"多頭": 1, "糾結": 0, "空頭": -1}
+
+
+def classify_relative_strength(rs_excess, rs_rating, ma_trend, benchmark_ma_trend, rs_line_new_high) -> str:
+    """
+    綜合「RS超額報酬% / RS Rating / MA排列(個股 vs 大盤) / RS創新高」四項訊號，
+    給出「大盤相比(強/弱)」的簡化文字判斷，方便一眼掃過整份掃描結果表格，
+    不用逐檔對照好幾個欄位自己判斷。
+
+    評分規則（每項 -1~+1 分，RS創新高只加分不扣分）：
+      1. RS超額報酬% 為正/負 → +1 / -1
+      2. RS Rating >= 70 / <= 30 → +1 / -1（中段 30~70 不加不扣）
+      3. MA排列強度（多頭 > 糾結 > 空頭）個股相對大盤更強/更弱 → +1 / -1
+         （例如大盤是「糾結」、個股是「多頭」→ +1；大盤「多頭」個股「糾結」→ -1）
+      4. RS創新高為 True → +1（沒創新高不扣分，只是額外的加分確認項）
+    加總分數 >= 2 判定「強」，<= -2 判定「弱」，其餘（分數不足、訊號互相矛盾）判定「持平」。
+
+    rs_excess 為 None（例如大盤資料當次抓取失敗，整體比較欄位都算不出來）時，直接回傳 "-"。
+    """
+    if rs_excess is None:
+        return "-"
+
+    score = 0.0
+    if rs_excess > 0:
+        score += 1
+    elif rs_excess < 0:
+        score -= 1
+
+    if isinstance(rs_rating, (int, float)):
+        if rs_rating >= 70:
+            score += 1
+        elif rs_rating <= 30:
+            score -= 1
+
+    if ma_trend in _TREND_RANK and benchmark_ma_trend in _TREND_RANK:
+        diff = _TREND_RANK[ma_trend] - _TREND_RANK[benchmark_ma_trend]
+        if diff > 0:
+            score += 1
+        elif diff < 0:
+            score -= 1
+
+    if rs_line_new_high is True:
+        score += 1
+
+    if score >= 2:
+        return "強"
+    if score <= -2:
+        return "弱"
+    return "持平"

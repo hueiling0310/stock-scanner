@@ -7,12 +7,15 @@
     streamlit run app.py
 """
 import os
+import io
+import base64
 import tempfile
 import sqlite3
 import time
 import random
 import requests
 import urllib3
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
@@ -24,6 +27,7 @@ import streamlit.components.v1 as components
 import db_utils
 import indicators
 import module_loader
+import benchmark_utils
 from scoring import calc_signal_quality_score, classify_signal_grade
 
 # 忽略憑證警告
@@ -32,7 +36,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 st.set_page_config(page_title="台股訊號模擬器", layout="wide")
 
 # ====== 定義賣出訊號與自訂樣式 ======
-SELL_LABELS = ["反向島狀", "廣義下降三法", "跌停", "移動停利"]
+# 「上升趨勢線跌破」(signal_module/trendline_breakout_sell.py) 歸類為賣出型訊號，
+# 加進 SELL_LABELS 後，下面的 _sell_tag_css 會自動把多選框(圖表標記訊號勾選/賣出條件1)
+# 裡這個標籤的底色變成綠色，跟其他賣出訊號一致，不用再另外寫一次 CSS 規則。
+SELL_LABELS = ["反向島狀", "廣義下降三法", "跌停", "移動停利", "上升趨勢線跌破"]
 
 # 針對多選框中的賣出訊號標籤變更為綠色。
 # 透過瀏覽器 DevTools 實際檢查過完整 DOM 結構後發現一個關鍵細節：
@@ -74,6 +81,84 @@ JOURNAL_LOG_SHEET = "log"
 JOURNAL_COLUMNS = ["交易日期", "股票代碼", "股票名稱", "進出場價格", "進出手法", "買賣張數", "Note"]
 JOURNAL_FONT_NAME = "微軟正黑體"
 JOURNAL_FONT_SIZE = 11
+JOURNAL_GITHUB_PATH = "Trading Journal.xlsx"  # 對應 GitHub repo 根目錄下的檔名
+
+
+# --------------------------------------------------------------------------
+# GitHub 同步工具 (交易紀錄 Trading Journal.xlsx)
+# --------------------------------------------------------------------------
+# 2026-08-16 新增：交易紀錄編輯器原本只讀寫這個部署容器本機磁碟的 Trading Journal.xlsx
+# (DEFAULT_JOURNAL_PATH)，跟 GitHub repo 根目錄裡的同名檔案完全沒有同步——使用者在
+# 編輯器按「儲存並關閉」只會寫到本機，而本機磁碟不是永久保存的：Streamlit Cloud
+# 重新部署/重啟這個 app 時會用 GitHub 上的版本重新複製一份蓋過去，等於編輯器存的
+# 內容隨時可能被悄悄蓋掉、遺失，使用者也完全看不到任何提示。
+# 這裡比照 0_📊_台股掃描器.py 的 upload_file_to_github()/github_repo_config() 寫法
+# (同一組 GITHUB_TOKEN/OWNER/REPO/BRANCH secrets)，讓交易紀錄編輯器：
+#   1. 開啟時 (只在讀取的是預設路徑、也就是對應 repo 檔案時) 先嘗試從 GitHub 抓最新
+#      版本蓋過本機那份，確保一定是從最新版本開始編輯，不會編輯到舊資料又存回去、
+#      覆蓋掉别人(或自己在別台裝置上)較新的紀錄。抓不到就靜默退回本機現有版本，
+#      使用者仍可正常編輯，不會比原本行為更差。
+#   2. 儲存時本機寫入成功後，自動再推一版回 GitHub repo，這樣 GitHub 上的檔案才是
+#      真正的資料來源；若 GITHUB_TOKEN 未設定或推送失敗，會另外顯示明確的警告，
+#      而不是靜默失敗讓使用者誤以為已經同步。
+#   3. 若使用者是從側邊欄「讀取 交易紀錄」自行上傳了檔案在編輯 (journal_path 不是
+#      DEFAULT_JOURNAL_PATH)，代表這份本來就不是 repo 檔案，不會嘗試抓取/推送 GitHub，
+#      避免誤用上傳的內容覆蓋掉 repo 裡真正的 Trading Journal.xlsx。
+def journal_github_config():
+    return {
+        "token": st.secrets.get("GITHUB_TOKEN", ""),
+        "owner": st.secrets.get("GITHUB_OWNER", "hueiling0310"),
+        "repo": st.secrets.get("GITHUB_REPO", "stock-scanner"),
+        "branch": st.secrets.get("GITHUB_BRANCH", "main"),
+    }
+
+
+def fetch_journal_bytes_from_github():
+    """從 GitHub repo 根目錄抓最新的 Trading Journal.xlsx 內容 (bytes)，抓不到回傳 None。"""
+    cfg = journal_github_config()
+    encoded_path = urllib.parse.quote(JOURNAL_GITHUB_PATH, safe="/")
+    url = f"https://raw.githubusercontent.com/{cfg['owner']}/{cfg['repo']}/{cfg['branch']}/{encoded_path}"
+    try:
+        resp = requests.get(url, timeout=15)
+        if resp.status_code == 200:
+            return resp.content
+    except Exception:
+        pass
+    return None
+
+
+def upload_journal_to_github(file_bytes: bytes, commit_message: str) -> bool:
+    """把交易紀錄 Excel 內容推回 GitHub repo 根目錄的 Trading Journal.xlsx (需要 GITHUB_TOKEN)。"""
+    cfg = journal_github_config()
+    token, owner, repo, branch = cfg["token"], cfg["owner"], cfg["repo"], cfg["branch"]
+    if not token or not owner or not repo:
+        return False
+
+    encoded_path = urllib.parse.quote(JOURNAL_GITHUB_PATH, safe="/")
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{encoded_path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    sha = None
+    try:
+        get_res = requests.get(url, headers=headers, params={"ref": branch}, timeout=15)
+        if get_res.status_code == 200:
+            sha = get_res.json().get("sha")
+
+        payload = {
+            "message": commit_message,
+            "content": base64.b64encode(file_bytes).decode("utf-8"),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+
+        put_res = requests.put(url, headers=headers, json=payload, timeout=30)
+        return put_res.status_code in (200, 201)
+    except Exception:
+        return False
 
 
 def _stable_upload_path(uploaded_file, cache_key: str, tmp_prefix: str, tmp_filename: str) -> str:
@@ -222,8 +307,32 @@ def journal_editor_dialog():
             try:
                 save_journal_log(save_target_path, save_df)
                 st.session_state.journal_log_df = load_journal_log(save_target_path)
-                st.success("已儲存交易紀錄！")
-                st.rerun()
+
+                # 只有存的是預設路徑 (對應 GitHub repo 根目錄的 Trading Journal.xlsx) 時，
+                # 才需要同步回 GitHub；若目前編輯的是側邊欄上傳的自訂檔案，那份本來就不是
+                # repo 檔案，不會推送 (見上方 journal_github_config 區塊的說明)。
+                if save_target_path == DEFAULT_JOURNAL_PATH:
+                    with open(save_target_path, "rb") as f:
+                        journal_bytes = f.read()
+                    commit_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+                    synced = upload_journal_to_github(journal_bytes, f"Update Trading Journal.xlsx {commit_time}")
+                    if synced:
+                        st.success("已儲存交易紀錄，並同步回 GitHub repo！")
+                        st.rerun()
+                    else:
+                        # 故意不在這裡呼叫 st.rerun()：如果馬上 rerun，這則警告訊息會在
+                        # 使用者還沒看清楚之前就被清掉，變成「同步失敗了但完全沒人發現」。
+                        # 保留對話框開著、警告留在畫面上，使用者可以確認 secrets 設定後
+                        # 再按一次「儲存並關閉」重試，或自行按「取消」關閉。
+                        st.warning(
+                            "⚠️ 已儲存到本機，但同步回 GitHub 失敗（可能是 GITHUB_TOKEN 未設定、權限不足，"
+                            "或網路問題）。這次的編輯目前只存在本機，app 之後若重新部署/重啟，可能會被 "
+                            "GitHub 上的舊版覆蓋而遺失，請確認 Streamlit 部署的 secrets 裡有設定 "
+                            "GITHUB_TOKEN 後再試一次。"
+                        )
+                else:
+                    st.success("已儲存交易紀錄！（目前編輯的是側邊欄上傳的自訂檔案，不會同步回 GitHub repo）")
+                    st.rerun()
             except PermissionError:
                 st.error(f"儲存失敗：檔案可能正被 Excel 或其他程式開啟中，請先關閉「{save_target_path}」後再試一次。")
             except Exception as e:
@@ -254,6 +363,16 @@ TREND_TIER_STYLE = {
     "short": {"color": "#111111", "label": "短期下降趨勢線", "hit_label": "短期突破"},
     "mid": {"color": "#c0392b", "label": "中短期下降趨勢線", "hit_label": "中短期突破"},
     "long": {"color": "#1f4fd6", "label": "中長期下降趨勢線", "hit_label": "中長期突破"},
+}
+
+# 「上升趨勢線跌破」(signal_module/trendline_breakout_sell.py, key="asc_trendline_breakdown")：
+# 屬於賣出型訊號 (SELL_LABELS)，畫在圖上的支撐線/跌破標籤統一用「綠色」系列 (三個等級用不同
+# 深淺的綠區分短/中短/中長期，而不是像下降趨勢線那樣三個等級各用不同色系)。
+ASC_TREND_SIGNAL_KEY = "asc_trendline_breakdown"
+ASC_TREND_TIER_STYLE = {
+    "short": {"color": "#27ae60", "label": "短期上升趨勢線", "hit_label": "短期跌破"},
+    "mid": {"color": "#1e8449", "label": "中短期上升趨勢線", "hit_label": "中短期跌破"},
+    "long": {"color": "#145a32", "label": "中長期上升趨勢線", "hit_label": "中長期跌破"},
 }
 
 # --------------------------------------------------------------------------
@@ -288,10 +407,18 @@ def unique_columns(fields: list) -> list:
         result.append(base if seen[base] == 1 else f"{base}_{seen[base]}")
     return result
 
-def fetch_twse_daily(report_date: str) -> pd.DataFrame:
+def fetch_twse_daily(report_date: str, return_payload: bool = False):
+    """
+    return_payload=True 時改回傳 (df, payload) tuple——2026-08-17 新增：
+    讓呼叫端可以把這裡已經打過一次的官方 MI_INDEX payload 直接轉給
+    benchmark_utils.update_benchmark_daily() 解析大盤指數，不用為了大盤
+    又對同一個官方端點多打一次一模一樣的請求，降低被限流(429)的風險。
+    """
+    payload = None
     try:
         payload = get_json(TWSE_URL, {"date": report_date, "type": "ALLBUT0999", "response": "json"})
-        if not check_status(payload, "上市"): return pd.DataFrame()
+        if not check_status(payload, "上市"):
+            return (pd.DataFrame(), payload) if return_payload else pd.DataFrame()
         for table in payload.get("tables", []):
             columns = unique_columns(table.get("fields", []))
             if "證券代號" in columns and "收盤價" in columns:
@@ -305,10 +432,11 @@ def fetch_twse_daily(report_date: str) -> pd.DataFrame:
                     df[col] = df[col].map(number)
                 df.insert(0, "Date", pd.to_datetime(report_date, format="%Y%m%d").date())
                 df.insert(1, "Market", "上市")
-                return df[df["Close"] > 0].drop_duplicates("SecurityCode")
-        return pd.DataFrame()
-    except Exception as e:
-        return pd.DataFrame()
+                result_df = df[df["Close"] > 0].drop_duplicates("SecurityCode")
+                return (result_df, payload) if return_payload else result_df
+        return (pd.DataFrame(), payload) if return_payload else pd.DataFrame()
+    except Exception:
+        return (pd.DataFrame(), payload) if return_payload else pd.DataFrame()
 
 def fetch_tpex_daily(report_date: str) -> pd.DataFrame:
     dt = datetime.strptime(report_date, "%Y%m%d")
@@ -691,6 +819,23 @@ if current_code and not stock_list_df.empty:
 with st.sidebar:
     with st.expander("交易紀錄編輯", expanded=False):
         if st.button("📝 開啟交易紀錄編輯器", use_container_width=True, key="open_journal_editor_btn"):
+            # 只有目前讀取的是預設路徑 (對應 GitHub repo 的 Trading Journal.xlsx) 時，
+            # 才嘗試先拉 GitHub 最新版蓋過本機那份，確保編輯器一開就是最新內容，
+            # 不會編輯到本機殘留的舊版又存回去、覆蓋掉別處已經更新過的紀錄。
+            # 若使用者是讀取自己上傳的檔案，維持原樣不動 (不覆寫使用者上傳的內容)。
+            active_journal_path = st.session_state.get("journal_path", DEFAULT_JOURNAL_PATH)
+            if active_journal_path == DEFAULT_JOURNAL_PATH:
+                with st.spinner("正在從 GitHub 抓取最新的交易紀錄..."):
+                    github_bytes = fetch_journal_bytes_from_github()
+                if github_bytes:
+                    try:
+                        with open(DEFAULT_JOURNAL_PATH, "wb") as f:
+                            f.write(github_bytes)
+                        st.session_state.journal_log_df = load_journal_log(DEFAULT_JOURNAL_PATH)
+                    except Exception:
+                        pass  # 抓到了但寫入本機失敗，靜默退回使用本機現有版本
+                # 抓不到 (github_bytes 為 None，例如 repo 裡還沒有這個檔案、或網路問題)
+                # 就靜默退回目前本機已載入的版本，使用者仍可正常編輯，不會比原本行為更差。
             journal_editor_dialog()
 
     st.subheader("🔄 更新資料庫")
@@ -736,6 +881,7 @@ with st.sidebar:
                 status_text = st.empty()
                 all_frames = []
                 total_twse, total_tpex = 0, 0
+                total_benchmark_days = 0
                 skipped_days = []
                 for i, (d_obj, date_str) in enumerate(zip(update_dates, date_list)):
                     status_text.text(f"抓取進度：{i + 1} / {len(date_list)}　日期：{date_str}")
@@ -746,8 +892,11 @@ with st.sidebar:
                     else:
                         twse_df = pd.DataFrame()
                         tpex_df = pd.DataFrame()
+                        mi_payload = None
                         for attempt in range(2):
-                            twse_df = fetch_twse_daily(date_str)
+                            # 2026-08-17 修改：改用 return_payload=True 拿回原始 MI_INDEX payload，
+                            # 下面同步大盤指數時可以直接複用，不用再多打一次官方 API。
+                            twse_df, mi_payload = fetch_twse_daily(date_str, return_payload=True)
                             if not twse_df.empty:
                                 break
                             time.sleep(1)
@@ -764,6 +913,15 @@ with st.sidebar:
                         else:
                             skipped_days.append(date_str)
 
+                        # 2026-08-16 新增：這裡跟 update_db.py 一樣是打官方 TWSE MI_INDEX 端點抓全市場資料，
+                        # 同步把「大盤（加權指數）」這天的收盤值也存進同一個 db_path，
+                        # 失敗不擋主流程（上市櫃資料已經抓到就照樣寫入），只是這天的比較欄位可能會是 "-"。
+                        try:
+                            if benchmark_utils.update_benchmark_daily(db_path, date_str, mi_index_payload=mi_payload):
+                                total_benchmark_days += 1
+                        except Exception:
+                            pass
+
                     if progress_bar is not None:
                         progress_bar.progress((i + 1) / len(date_list))
                     if i < len(date_list) - 1:
@@ -774,7 +932,7 @@ with st.sidebar:
                     combined_df = pd.concat(all_frames, ignore_index=True)
                     st.cache_resource.clear() # 寫入前先切斷緩存讀取連線
                     save_to_database(db_path, combined_df)
-                    st.success(f"全市場更新成功！共 {len(date_list) - len(skipped_days)} 天，上市 {total_twse} 筆 / 上櫃 {total_tpex} 筆")
+                    st.success(f"全市場更新成功！共 {len(date_list) - len(skipped_days)} 天，上市 {total_twse} 筆 / 上櫃 {total_tpex} 筆；大盤指數同步 {total_benchmark_days} 天")
                     if skipped_days:
                         st.caption(f"以下日期無交易資料，已略過：{'、'.join(skipped_days)}")
                 else:
@@ -793,6 +951,12 @@ with st.sidebar:
                     if not range_df.empty:
                         st.cache_resource.clear() # 寫入前先切斷緩存讀取連線
                         save_to_database(db_path, range_df)
+                        # 2026-08-16 新增：yfinance 單股模式不會經過官方 TWSE 端點，
+                        # 順便確保「大盤」資料至少跟這次更新的最新日期一樣新（不足才會補，成本很低）。
+                        try:
+                            benchmark_utils.ensure_benchmark_history(db_path, report_date=date_list[-1])
+                        except Exception:
+                            pass
                         st.success(f"單股更新成功！已更新 {current_code} {current_name}，共 {len(range_df)} 筆交易日資料")
                     else:
                         st.warning(f"無法從 yfinance 取得 {range_label} 的資料 (可能尚未開盤、代碼錯誤，或區間內無交易日)")
@@ -834,6 +998,11 @@ with st.sidebar:
                     all_df = pd.concat(success_rows, ignore_index=True)
                     st.cache_resource.clear() # 寫入前先切斷緩存讀取連線
                     save_to_database(db_path, all_df)
+                    # 2026-08-16 新增：批次模式一樣不會經過官方 TWSE 端點，同步確保「大盤」資料夠新。
+                    try:
+                        benchmark_utils.ensure_benchmark_history(db_path, report_date=date_list[-1])
+                    except Exception:
+                        pass
                     st.success(f"批次更新完成！成功 {len(success_rows)} 檔，共 {len(all_df)} 筆交易日資料，失敗 {len(fail_list)} 檔。")
                     if fail_list:
                         with st.expander(f"查看失敗的 {len(fail_list)} 檔股票"):
@@ -856,7 +1025,228 @@ with st.sidebar:
 
     st.subheader("日期設定")
     scan_start_date = st.date_input("掃描起始日期", value=pd.to_datetime("2026-04-27"), key="chart_scan_start_date")
+    # 「結束日期」= 圖表要畫到哪一天為止。原本「📋 掃描結果瀏覽」有一個獨立的「K線日期」
+    # 欄位可以覆寫這個值，但因為使用者要展開側邊欄才看得到有沒有生效、效果又不明顯
+    # (常常只差一兩根K棒)，2026-08-16 依需求移除該欄位，圖表結束日期統一只由這裡控制。
     scan_end_date = st.date_input("結束日期", value=datetime.today().date(), key="chart_scan_end_date")
+
+
+# --------------------------------------------------------------------------
+# 📋 掃描結果瀏覽
+# --------------------------------------------------------------------------
+# 原本設計是掃描器跟這個頁面共用同一份 twse_ohlcv.db，掃描完直接寫表、這裡直接讀表。
+# 但實測發現兩邊其實是分開部署、各自獨立的磁碟 (不是同一個容器)，掃描器寫進自己那份
+# db 的 signal_scan_results 表，這個頁面讀到的是自己那份 db，兩者對不上，一直是空的。
+#
+# 兩邊真正共用、有實際同步的地方只有 GitHub repo：掃描器每次掃描完成後，會把
+# Database/signal_tracking.csv 上傳成 Database/signal_tracking_{YYYYMMDD}.csv
+# (詳見 0_📊_台股掃描器.py 的 upload_tracking_file_to_github)。所以這裡改成：
+#   1. 先試本地 signal_scan_results 表 (萬一以後兩邊真的合併成同一個部署，優先讀這個，不用打網路)
+#   2. 讀不到才改成從 GitHub 抓當天上傳的 signal_tracking_{date}.csv 當備援資料來源
+# 這份 CSV 是累積寫入的 (不會每天重置)，抓回來後還要再依 scan_date 欄位篩選一次，
+# 不能直接假設整份檔案內容都等於檔名那天的資料。
+#
+# 排版邏輯 (2026-08-16 依使用者需求重新設計，同日移除「K線日期」欄位)：
+#   單行 3 個欄位 + 2 個按鈕，取代原本的卡片網格瀏覽：
+#     掃描資料日期 → 訊號類型 (多選) → 股票代碼/名稱 (單選)　三者階層連動篩選，
+#     ✅ 查看K線圖 (自動帶入下方 Main 控制列並觸發 RUN)、🔄 重新整理 (清快取重抓 GitHub)。
+#   圖表要畫到哪一天，統一交給側邊欄「日期設定」的「結束日期」控制 (不在這裡重複)。
+GITHUB_TRACKING_OWNER = st.secrets.get("GITHUB_OWNER", "hueiling0310")
+GITHUB_TRACKING_REPO = st.secrets.get("GITHUB_REPO", "stock-scanner")
+GITHUB_TRACKING_BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
+GITHUB_TRACKING_DIR = st.secrets.get("GITHUB_DATABASE_DIR", "Database")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_tracking_csv_from_github(date_str: str) -> pd.DataFrame:
+    """抓 GitHub 上 Database/signal_tracking_{date}.csv，抓不到 (例如那天沒掃描/沒上傳) 回傳空表。"""
+    filename = f"signal_tracking_{date_str.replace('-', '')}.csv"
+    url = (
+        f"https://raw.githubusercontent.com/{GITHUB_TRACKING_OWNER}/{GITHUB_TRACKING_REPO}"
+        f"/{GITHUB_TRACKING_BRANCH}/{GITHUB_TRACKING_DIR}/{filename}"
+    )
+    try:
+        resp = requests.get(url, timeout=15)
+        if resp.status_code != 200:
+            return pd.DataFrame()
+        return pd.read_csv(io.BytesIO(resp.content), encoding="utf-8-sig")
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _find_latest_github_tracking_date(probe_days: int = 10) -> str:
+    """
+    從今天開始往回試探最近 `probe_days` 天，找出第一個「GitHub 上確實存在
+    signal_tracking_{date}.csv」的日期 (掃描器每次掃描都會用當天日期上傳這個檔名，
+    所以檔案存在 = 那天有掃描紀錄)。找到第一個存在的就停止，不會把每一天都打一輪。
+
+    這裡刻意不用 GitHub Contents API 列目錄 (api.github.com)，改成沿用已經驗證過
+    可正常運作的 raw.githubusercontent.com 逐日探測方式：
+      1. 兩者行為等價，但 api.github.com 對未認證請求有每小時 60 次的速率限制，
+         Streamlit Cloud 上多個 app 常共用對外 IP，容易被其他服務排擠而超過額度。
+      2. `_fetch_tracking_csv_from_github` 已經是本頁面既有、已被使用者實測成功的
+         抓檔路徑，這裡直接重用同一個函式 (且共用同一份 5 分鐘快取)，不用再多維護
+         一條獨立的網路呼叫邏輯。
+    找不到 (例如最近 probe_days 天內都沒掃描/沒上傳) 則回傳空字串，由呼叫端退回今天。
+    """
+    today = datetime.today().date()
+    for i in range(probe_days):
+        candidate = today - timedelta(days=i)
+        candidate_str = candidate.strftime("%Y-%m-%d")
+        if not _fetch_tracking_csv_from_github(candidate_str).empty:
+            return candidate_str
+    return ""
+
+
+def _bare_stock_code(raw_code) -> str:
+    """去掉 .TW/.TWO 後綴，統一成跟 stock_options / SecurityCode 一致的純數字代碼。"""
+    return str(raw_code).strip().split(".")[0]
+
+
+def _default_browse_scan_date():
+    """
+    「掃描資料日期」預設值：優先抓本機資料庫最新的掃描日期；抓不到再看 GitHub 上
+    實際存在的最新 signal_tracking 檔案日期；兩邊都沒有才退回今天。
+    （日期選擇器本身仍是自由選擇，使用者可隨時手動改選任何一天。）
+    """
+    try:
+        with sqlite3.connect(db_path) as _c:
+            local_dates = db_utils.get_scan_result_dates(_c, limit=1)
+        if local_dates:
+            return pd.to_datetime(local_dates[0]).date()
+    except Exception:
+        pass
+    latest_github_date = _find_latest_github_tracking_date()
+    if latest_github_date:
+        return pd.to_datetime(latest_github_date).date()
+    return datetime.today().date()
+
+
+st.markdown("### 📋 Sotck Simulator")
+
+with st.expander("展開瀏覽掃描結果", expanded=False):
+    sel_col1, sel_col3, sel_col4, btn_col1, btn_col2 = st.columns([1, 1.6, 1.8, 0.9, 0.9])
+
+    # --- 欄位1：掃描資料日期 ---
+    if "browse_scan_date" not in st.session_state:
+        st.session_state["browse_scan_date"] = _default_browse_scan_date()
+    with sel_col1:
+        browse_scan_date = st.date_input("掃描資料日期", key="browse_scan_date")
+    browse_date_str = pd.to_datetime(browse_scan_date).strftime("%Y-%m-%d")
+
+    # 掃描資料日期一改變，底下依賴它的「訊號類型」「股票代碼/名稱」選擇就失去意義，
+    # 直接清掉讓使用者在新的日期重新選，避免殘留舊日期的選項造成 widget 選項不合法的錯誤。
+    if st.session_state.get("_browse_last_scan_date") != browse_date_str:
+        st.session_state["_browse_last_scan_date"] = browse_date_str
+        st.session_state.pop("browse_signal_type_filter", None)
+        st.session_state.pop("browse_stock_pick", None)
+
+    # --- 依「掃描資料日期」抓當天掃描結果：本機資料庫優先，讀不到才用 GitHub CSV 備援 ---
+    data_source_note = ""
+    try:
+        with sqlite3.connect(db_path) as _scan_conn:
+            scan_results_df = db_utils.get_scan_results(_scan_conn, browse_date_str)
+        if not scan_results_df.empty:
+            data_source_note = "（來源：本機資料庫）"
+    except Exception:
+        scan_results_df = pd.DataFrame()
+
+    if scan_results_df.empty:
+        github_df = _fetch_tracking_csv_from_github(browse_date_str)
+        if not github_df.empty and "scan_date" in github_df.columns:
+            day_df = github_df[github_df["scan_date"].astype(str) == browse_date_str].copy()
+            if not day_df.empty:
+                scan_results_df = pd.DataFrame({
+                    "code": day_df["代碼"].apply(_bare_stock_code),
+                    "name": day_df.get("股票名稱", ""),
+                    "signal_types": day_df.get("訊號類型", ""),
+                    "signal_score": pd.to_numeric(day_df.get("訊號分數"), errors="coerce"),
+                    "signal_grade": day_df.get("追蹤等級", ""),
+                    "price": pd.to_numeric(day_df.get("entry_price"), errors="coerce"),
+                    "pct": pd.NA,  # signal_tracking.csv 沒有存漲跌%，這裡留空不顯示
+                    "volume_lots": pd.to_numeric(day_df.get("成交量(張)"), errors="coerce"),
+                }).sort_values("signal_score", ascending=False).reset_index(drop=True)
+                data_source_note = "（來源：GitHub Database/signal_tracking，兩邊部署分開、非即時同步，可能落後於最新一次掃描）"
+
+    has_data = not scan_results_df.empty
+
+    # --- 欄位3：訊號類型 (多選)，選項來自「掃描資料日期」當天實際出現過的類型 ---
+    # signal_types 欄位是掃描器用「、」把單一股票當天觸發的多個訊號類型串成一個字串
+    # (例如「3K反轉、島狀反轉」)，這裡拆開取聯集。篩選邏輯是 AND：選了多個訊號類型時，
+    # 該股票當天要「同時」命中所有已選類型才會留下 (單純訊號濾波器邏輯)，不是命中任一個
+    # 就算數。不會把同一檔股票拆成多列 (股票代碼/名稱清單本來就已經是一檔股票一列)。
+    all_signal_types = sorted({
+        t for types_str in (scan_results_df["signal_types"].fillna("").tolist() if has_data else [])
+        for t in types_str.split("、") if t and t != "-"
+    })
+    with sel_col3:
+        selected_types = st.multiselect(
+            "訊號類型", options=all_signal_types, key="browse_signal_type_filter", disabled=not has_data,
+        )
+
+    if has_data and selected_types:
+        type_filtered_df = scan_results_df[
+            scan_results_df["signal_types"].fillna("").apply(
+                lambda s: all(t in s.split("、") for t in selected_types)
+            )
+        ]
+    else:
+        type_filtered_df = scan_results_df
+
+    # --- 欄位4：股票代碼/名稱 (單選)，同一檔股票只顯示一次 ---
+    stock_pick_options = [
+        f"{_bare_stock_code(r['code'])} {r.get('name', '')}"
+        for r in type_filtered_df.drop_duplicates(subset=["code"]).to_dict("records")
+    ] if has_data else []
+    select_options = stock_pick_options if stock_pick_options else ["(無符合股票)"]
+    if st.session_state.get("browse_stock_pick") not in select_options:
+        st.session_state.pop("browse_stock_pick", None)
+    with sel_col4:
+        picked_stock = st.selectbox(
+            "股票代碼/名稱", options=select_options, disabled=not stock_pick_options, key="browse_stock_pick",
+        )
+
+    # --- 按鈕1：查看K線圖 (自動帶入下方 Main 控制列並觸發 RUN) ---
+    with btn_col1:
+        st.write("")
+        view_clicked = st.button(
+            "✅ 查看K線圖", use_container_width=True,
+            key="browse_view_btn", disabled=not stock_pick_options,
+        )
+
+    # --- 按鈕2：重新整理 (清快取重抓 GitHub) ---
+    with btn_col2:
+        st.write("")
+        if st.button("🔄 重新整理", use_container_width=True, key="browse_refresh_btn"):
+            _fetch_tracking_csv_from_github.clear()
+            _find_latest_github_tracking_date.clear()
+            st.rerun()
+
+    if view_clicked and stock_pick_options:
+        picked_code = picked_stock.split(" ")[0]
+        matched_option = next(
+            (opt for opt in stock_options if opt.startswith(f"{picked_code} ")), None
+        )
+        if matched_option:
+            st.session_state["main_stock_choice"] = matched_option
+            st.session_state["chart_scan_target_date"] = pd.to_datetime(browse_date_str).date()
+            # 圖表結束日期不在這裡覆寫，維持使用者在側邊欄「日期設定」設定的「結束日期」
+            # (K線日期欄位已於 2026-08-16 移除，避免兩個地方都能改同一個效果、卻只有
+            # 側邊欄那個看得到目前的值)。
+            st.session_state["_pending_chart_run"] = True
+            st.rerun()
+        else:
+            st.warning(f"twse_ohlcv.db 裡找不到股票代碼 {picked_code}，可能尚未更新這檔的價格資料。")
+
+    if not has_data:
+        st.info(
+            f"{browse_date_str} 目前沒有掃描結果（本機資料庫跟 GitHub 上的 "
+            f"Database/signal_tracking_{browse_date_str.replace('-', '')}.csv 都讀不到資料）。"
+            f"請確認當天有跑過「台股掃描器」的掃描，且該次掃描已自動上傳到 GitHub。"
+        )
+    else:
+        st.caption(f"共 {len(stock_pick_options)} 檔（{browse_date_str}，符合已選訊號類型）{data_source_note}")
 
 
 # --------------------------------------------------------------------------
@@ -889,7 +1279,12 @@ with col3:
 with col4:
     st.write("")
     st.write("")
-    run_clicked = st.button("RUN", use_container_width=True, type="primary", key="chart_run_btn")
+    # `_pending_chart_run` 由上方「📋 掃描結果瀏覽」的「✅ 查看K線圖」按鈕設定：
+    # 按下該按鈕時會先把 main_stock_choice / chart_scan_target_date 帶入 session_state
+    # 再 st.rerun()，這裡讀到旗標後視同使用者按下了 RUN，沿用下面完整的既有 RUN 邏輯
+    # (指標計算＋模擬回測＋K線＋B/S/停利標記)，不用另外重寫一套圖表繪製流程。
+    run_clicked = st.button("RUN", use_container_width=True, type="primary", key="chart_run_btn") \
+        or st.session_state.pop("_pending_chart_run", False)
 
 
 # --------------------------------------------------------------------------
@@ -941,16 +1336,29 @@ if run_clicked:
             # 不會因為單日驗證掃描日期(scan_target_date)超出此範圍而被意外撐大
             display_df = full_df[(full_df.index >= scan_start_str) & (full_df.index <= chart_end_str)]
         
-            # 2. 執行區間模擬回測邏輯 
+            # 2. 執行區間模擬回測邏輯
             trades = []
             active_positions = []
-            last_buy_idx = {}  
-            max_capital_used = 0  
-        
+            last_buy_idx = {}
+            max_capital_used = 0
+            # 收集回測迴圈裡「訊號模組執行失敗」的紀錄 (訊號名稱/日期/錯誤訊息)，
+            # 之前是 except: pass 整個吞掉、使用者完全看不到；現在改成不中斷回測，
+            # 但把每一筆失敗都記下來，跑完後在「模擬回測績效」上方集中顯示一段警告。
+            signal_error_log = []
+
+            # 效能最佳化 (2026-08-16)：原本迴圈裡「每一天」都對 full_df 做 .loc[d, col]
+            # 標籤查找 (Close、Bias60)，label-based .loc 在迴圈內重複呼叫的開銷不小；
+            # 這裡改成迴圈開始前先把需要的欄位一次性轉成 {日期: 值} 的 dict、以及
+            # {日期: 在full_df裡的位置} 的 dict，迴圈內全部改用 dict 查找。純粹是查找方式
+            # 改變，不影響任何計算邏輯或回測結果 (不動訊號模組本身的執行方式)。
+            full_df_close = full_df["Close"].to_dict()
+            full_df_bias60 = full_df["Bias60"].to_dict() if "Bias60" in full_df.columns else {}
+            full_df_pos = {date: pos for pos, date in enumerate(full_df.index)}
+
             if enable_backtest:
                 for i, d in enumerate(display_df.index):
-                    current_price = full_df.loc[d, "Close"]
-                
+                    current_price = full_df_close[d]
+
                     # --- 賣出檢查 ---
                     if len(active_positions) > 0:
                         triggered_sell_signals = []
@@ -960,27 +1368,28 @@ if run_clicked:
                                 try:
                                     if st.session_state.signal_registry[sig]["func"](ctx_sell).hit:
                                         triggered_sell_signals.append(sig)
-                                except Exception:
-                                    pass
-                            
+                                except Exception as e:
+                                    signal_error_log.append({
+                                        "訊號": signal_labels.get(sig, sig), "日期": d,
+                                        "動作": "賣出檢查", "錯誤": str(e),
+                                    })
+
                         remaining_positions = []
-                        sold_any = False
-                    
+
                         for pos in active_positions:
                             profit_pct = (current_price - pos["buy_price"]) / pos["buy_price"] * 100
                             sell_reason = None
 
                             eligible_signal = next((sig for sig in triggered_sell_signals if sig != REVERSE_3K_SIGNAL_KEY or profit_pct > REVERSE_3K_MIN_PROFIT_PCT), None)
-                        
+
                             if profit_pct <= -stop_loss_pct:
                                 sell_reason = f"停損出場 ({profit_pct:.1f}%)"
                             elif enable_take_profit and profit_pct >= take_profit_pct:
                                 sell_reason = f"停利達標 ({profit_pct:.1f}%)"
                             elif eligible_signal is not None:
                                 sell_reason = f"訊號出場 ({signal_labels.get(eligible_signal, eligible_signal)})"
-                            
+
                             if sell_reason:
-                                sold_any = True
                                 pnl = (current_price - pos["buy_price"]) * pos["shares"] * 1000
                                 trades.append({
                                     "買入日期": pos["buy_date"], "買入理由": pos["signal_label"],
@@ -992,13 +1401,17 @@ if run_clicked:
                                 })
                             else:
                                 remaining_positions.append(pos)
-                            
+
                         active_positions = remaining_positions
-                        if sold_any: continue
+                        # 2026-08-16 修正：原本「當天只要有賣出就直接 continue」，導致同一天
+                        # 停損/停利/訊號出場後，即使當天另有買入訊號觸發，也結構性地不可能同日
+                        # 再進場。改成賣出檢查結束後照常往下走買入檢查，讓同日再進場成為可能；
+                        # 「同訊號再次買入冷卻期」(last_buy_idx/buy_cooldown) 不受影響，仍會正常
+                        # 擋下同一個訊號在冷卻期內的重複買入 (含當天賣出、當天又觸發同訊號的情況)。
 
                     # --- 買入檢查 ---
                     if buy_signals:
-                        current_bias60 = full_df.loc[d, "Bias60"] if "Bias60" in full_df.columns else 0
+                        current_bias60 = full_df_bias60.get(d, 0)
                         if enable_bias60_filter and pd.notna(current_bias60) and current_bias60 > max_bias60_buy_pct:
                             pass
                         else:
@@ -1011,12 +1424,23 @@ if run_clicked:
                                 try:
                                     if st.session_state.signal_registry[sig]["func"](ctx_buy).hit:
                                         hit_today.append(sig)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    signal_error_log.append({
+                                        "訊號": signal_labels.get(sig, sig), "日期": d,
+                                        "動作": "買入檢查", "錯誤": str(e),
+                                    })
 
                             entry_score, entry_grade, entry_signals_text = None, None, ""
                             if hit_today:
-                                score_data = build_score_input(full_df, d, i)
+                                # 2026-08-16 修正：build_score_input() 內部用第三個參數當「在
+                                # full_df 裡的位置」去抓前1天/前20天的收盤價算漲跌幅%與波動率，
+                                # 但這裡原本傳的是 i (在 display_df 裡的位置)。full_df 為了讓
+                                # 指標(MA/KD等)在區間起點就有值，會比 display_df 往前多抓90天
+                                # 緩衝資料，兩邊位置對不上，導致算出來的評分其實是抓到緩衝期
+                                # (跟掃描區間無關的更早日期)的資料，評分本身是錯的，連帶「訊號
+                                # 評分低於門檻不買」這個過濾器也是用錯的數字在判斷。改用
+                                # full_df_pos[d] 取得 d 在 full_df 裡的正確位置。
+                                score_data = build_score_input(full_df, d, full_df_pos[d])
                                 score_labels = [signal_labels.get(s, s) for s in hit_today]
                                 score_kinds = {lbl: "buy" for lbl in score_labels}
                                 entry_score = calc_signal_quality_score(score_data, score_labels, score_kinds)
@@ -1037,7 +1461,10 @@ if run_clicked:
                                 current_invested = sum(p["buy_price"] * p["shares"] * 1000 for p in active_positions)
                                 max_capital_used = max(max_capital_used, current_invested)
 
-            st.session_state.run_results = (display_df, results, stock_code, stock_name, scan_target_str, trades, active_positions, enable_backtest, max_capital_used)
+            st.session_state.run_results = (
+                display_df, results, stock_code, stock_name, scan_target_str,
+                trades, active_positions, enable_backtest, max_capital_used, signal_error_log,
+            )
     except Exception as e:
         st.exception(e)
 
@@ -1048,7 +1475,7 @@ if run_clicked:
 chart_placeholder = st.container()
 with chart_placeholder:
     if st.session_state.run_results is not None:
-        display_df, results, code, name, scan_target_str, trades, active_positions, enable_backtest, max_capital_used = st.session_state.run_results
+        display_df, results, code, name, scan_target_str, trades, active_positions, enable_backtest, max_capital_used, signal_error_log = st.session_state.run_results
 
         _cur_target_str = pd.to_datetime(scan_target_date).strftime("%Y-%m-%d")
         if code != stock_code or scan_target_str != _cur_target_str:
@@ -1118,7 +1545,11 @@ with chart_placeholder:
 
         color_idx = 0
         for key, res in results.items():
-            if key == TREND_SIGNAL_KEY: continue
+            # trendline_breakout / asc_trendline_breakdown 的 marks 是
+            # (tier_key, anchor1_date, anchor2_date, tier_hit) + ("scan", date) 的特殊結構，
+            # 不是單純日期列表，下面通用的「單日訊號標記」邏輯無法處理，改用各自專屬的
+            # 繪圖區塊 (見下方)，這裡先跳過避免跑進通用邏輯出錯。
+            if key in (TREND_SIGNAL_KEY, ASC_TREND_SIGNAL_KEY): continue
             if not res.hit or not res.marks: continue
             
             label = st.session_state.signal_registry[key]["label"]
@@ -1176,6 +1607,43 @@ with chart_placeholder:
                         text=style["hit_label"], showarrow=True, arrowhead=2,
                         arrowcolor=style["color"], font=dict(color=style["color"], size=12),
                         ax=0, ay=30, row=1, col=1,
+                    )
+
+        # ===== 上升趨勢線跌破 (asc_trendline_breakdown)：畫出支撐線 + 跌破標籤 =====
+        # 邏輯跟上面「下降趨勢線突破」完全對稱，差異只在於：
+        #   1. 連的是「低點(Low)」而不是「高點(High)」(上升趨勢線 = 低點與低點的連線)。
+        #   2. 三個等級統一用綠色系 (ASC_TREND_TIER_STYLE)，呼應這是賣出型訊號。
+        #   3. 線用虛線 (dash="dash") 表示「支撐線」，跟下降趨勢線的實線做視覺區分。
+        #   4. 跌破標籤文字放在K線上方、箭頭往下指 (ay 負值)，因為是賣出訊號觸發點。
+        asc_tres = results.get(ASC_TREND_SIGNAL_KEY)
+        if asc_tres is not None and asc_tres.marks:
+            scan_d = None
+            for item in asc_tres.marks:
+                if item[0] == "scan":
+                    scan_d = item[1]
+                    continue
+                tier_key, a1, a2, tier_hit = item
+                style = ASC_TREND_TIER_STYLE.get(tier_key)
+                if style is None or a1 is None or a2 is None: continue
+                if a1 not in display_dates or a2 not in display_dates: continue
+                x1p, x2p = display_dates.index(a1), display_dates.index(a2)
+                if x2p == x1p: continue
+                y1, y2 = display_df.loc[a1, "Low"], display_df.loc[a2, "Low"]
+                slope = (y2 - y1) / (x2p - x1p)
+                end_pos = len(display_dates) - 1
+                end_date = display_dates[end_pos]
+                end_val = y1 + slope * (end_pos - x1p)
+                fig.add_trace(go.Scatter(
+                    x=[a1, end_date], y=[y1, end_val], mode="lines",
+                    line=dict(color=style["color"], width=2, dash="dash"),
+                    name=style["label"], hoverinfo="skip",
+                ), row=1, col=1)
+                if tier_hit and scan_d is not None and scan_d in display_df.index:
+                    fig.add_annotation(
+                        x=scan_d, y=display_df.loc[scan_d, "Close"],
+                        text=style["hit_label"], showarrow=True, arrowhead=2,
+                        arrowcolor=style["color"], font=dict(color=style["color"], size=12),
+                        ax=0, ay=-30, row=1, col=1,
                     )
 
         if enable_backtest:
@@ -1264,7 +1732,7 @@ with chart_placeholder:
 # 下方顯示區塊: 訊號結果 & 回測績效
 # --------------------------------------------------------------------------
 if st.session_state.run_results is not None:
-    display_df, results, code, name, scan_target_str, trades, active_positions, enable_backtest, max_capital_used = st.session_state.run_results
+    display_df, results, code, name, scan_target_str, trades, active_positions, enable_backtest, max_capital_used, signal_error_log = st.session_state.run_results
 
     _cur_target_str2 = pd.to_datetime(scan_target_date).strftime("%Y-%m-%d")
     if code != stock_code or scan_target_str != _cur_target_str2:
@@ -1285,7 +1753,16 @@ if st.session_state.run_results is not None:
     if enable_backtest and col_backtest is not None:
         with col_backtest:
             st.markdown("**模擬回測績效 (清單顯示)**")
-            
+
+            # 回測迴圈裡訊號模組執行失敗的警告 (2026-08-16 新增)：原本是 except: pass
+            # 整個吞掉，使用者完全不知道某個訊號模組在回測期間偶爾/持續執行失敗。
+            # 現在集中列在交易明細上方，不中斷回測本身，但讓使用者知道哪些訊號、
+            # 哪些日期發生了錯誤，自行判斷該結果是否可信。
+            if signal_error_log:
+                st.warning(f"⚠️ 回測期間有 {len(signal_error_log)} 次訊號執行失敗，以下交易結果可能不完整：")
+                with st.expander(f"查看訊號執行失敗明細 ({len(signal_error_log)} 筆)"):
+                    st.dataframe(pd.DataFrame(signal_error_log), use_container_width=True, hide_index=True)
+
             if trades:
                 df_trades = pd.DataFrame(trades)
                 total_pnl = df_trades["損益(元)"].sum()

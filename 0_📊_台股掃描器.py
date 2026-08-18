@@ -20,6 +20,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
+import db_utils
+import benchmark_utils
 from common_fubon import (
     REFRESH_SEC,
     FORCE_SCAN_ALL_STOCKS_FROM_FILE,
@@ -39,7 +41,9 @@ from common_fubon import (
 from signals import (
     compute_indicators,
     get_signal_registry,
+    build_base_context,
 )
+from signals.context import classify_relative_strength
 
 from scoring import (
     LOCAL_DATABASE_DIR,
@@ -60,6 +64,9 @@ st.set_page_config(layout="wide")
 # ===== 常數設定 =====
 GROUPS_FILE = "stock_groups.json"
 APP_LOGO = "dog.jpg"
+# twse_ohlcv.db 跟這個檔案放在同一層 (repo 根目錄)，Stock simulator 也是讀寫同一份檔案，
+# 所以掃描結果寫入資料庫後，模擬器那邊的「掃描結果瀏覽」不需要另外做同步。
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "twse_ohlcv.db")
 
 GITHUB_DATABASE_DIR = st.secrets.get("GITHUB_DATABASE_DIR", "Database")
 AUTO_UPLOAD_GITHUB = bool(st.secrets.get("AUTO_UPLOAD_GITHUB", False))
@@ -210,7 +217,7 @@ def upload_tracking_file_to_github(commit_suffix: str = "") -> bool:
 
 # ===== Excel 匯出工具 =====
 def normalize_rows_for_excel(rows):
-    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "訊號分數", "追蹤等級", "MA位置", "MA排列", "訊號方向", "訊號類型", "訊號說明", "來源"]
+    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "訊號方向", "訊號類型", "大盤相比(強/弱)", "波動率%", "RS創新高", "RS Rating", "MA位置", "MA排列", "RS加權報酬%", "RS超額報酬%", "訊號分數", "追蹤等級", "大盤MA位置", "大盤MA排列", "訊號說明", "來源"]
     if not rows: return pd.DataFrame(columns=columns)
     df = pd.DataFrame(rows).drop_duplicates(subset=["代碼"]).copy()
     if "代碼網址" in df.columns: df.drop(columns=["代碼網址"], inplace=True)
@@ -426,7 +433,9 @@ with scan_status_col:
 
 if st.session_state.scan_enabled: st.caption("🟢 掃描狀態：執行中")
 elif "last_scan_result" in st.session_state:
-    st.caption(f"✅ 掃描狀態：已完成，上次完成時間：{st.session_state.last_scan_result.get('scan_completed_at', '-')}｜成交量下限：{st.session_state.last_scan_result.get('min_volume_lots', 1000)} 張")
+    _db_saved = st.session_state.get("last_scan_db_saved")
+    _db_saved_text = f"｜已寫入資料庫供 Stock simulator 讀取：{_db_saved} 檔" if _db_saved is not None else ""
+    st.caption(f"✅ 掃描狀態：已完成，上次完成時間：{st.session_state.last_scan_result.get('scan_completed_at', '-')}｜成交量下限：{st.session_state.last_scan_result.get('min_volume_lots', 1000)} 張{_db_saved_text}")
 else: st.caption("⚪ 掃描狀態：已停止，按「開始掃描」才會抓取資料。")
 
 selected_signal_keys = [
@@ -502,6 +511,44 @@ if should_run_scan:
     history_map = bulk_download_db_history(all_unique_symbols, scan_today_str)
     yf_today_map = bulk_download_yfinance_today(all_unique_symbols, scan_today_str) if (yf is not None and active_price_source == "Yfinance") else {}
 
+    # ===== 大盤（加權指數）基準值：整次掃描只算一次，全部股票共用比對 =====
+    # 2026-08-16 新增：個股 vs 大盤比較（大盤MA位置/大盤MA排列/RS超額報酬%/RS Line創新高/RS Rating）。
+    # 先確保 DB 內大盤歷史資料夠新（背景自我修復，抓不到不擋主掃描流程），
+    # 再用跟個股完全相同的 build_base_context() 算出大盤自己的 MA/RS 基準值。
+    benchmark_ctx = None
+    benchmark_df = pd.DataFrame()
+    try:
+        benchmark_utils.ensure_benchmark_history(DB_PATH, report_date=tw_now.strftime("%Y%m%d"))
+    except Exception:
+        pass  # 自我修復失敗不擋主流程，下面仍會嘗試直接讀 DB 現有資料
+    try:
+        # 2026-08-16 新增：跟個股「今日」即時價一樣的兩段式作法——
+        # 歷史(不含今天)固定讀本地 DB，「今天」這一筆額外即時抓一次 yfinance，
+        # 兩者合併後大盤才不會在盤中一直停留在昨收，跟個股比較才有意義。
+        # 只有這次掃描的「今日」價格來源是 Yfinance 時才額外抓（跟 yf_today_map 的觸發條件一致），
+        # 其餘來源(WebSocket/本地資料庫)沿用資料庫既有值，避免多打不必要的 yfinance 請求。
+        benchmark_df = benchmark_utils.get_benchmark_ohlcv(DB_PATH, end_date_str=scan_today_str)
+        if yf is not None and active_price_source == "Yfinance":
+            try:
+                benchmark_today_df = benchmark_utils.fetch_taiex_today_yfinance(scan_today_str)
+                benchmark_df = benchmark_utils.combine_benchmark_history_and_today(benchmark_df, benchmark_today_df)
+            except Exception:
+                pass  # 即時補值失敗不擋主流程，沿用資料庫既有的歷史資料
+        if benchmark_df is not None and len(benchmark_df) >= 21:
+            benchmark_price = float(benchmark_df["Close"].iloc[-1])
+            benchmark_ctx = build_base_context(benchmark_df, benchmark_price)
+        else:
+            st.warning("⚠️ 大盤（加權指數）歷史資料不足，本次掃描暫不顯示「大盤MA位置/大盤MA排列/RS超額報酬%/RS創新高」比較欄位。")
+    except Exception as e:
+        benchmark_ctx = None
+        st.warning(f"⚠️ 大盤（加權指數）基準值計算失敗，本次掃描暫不顯示比較欄位：{e}")
+
+    # RS Rating 用：收集本次掃描「所有成功抓到資料」股票的 RS超額報酬%，全市場跑完後統一算百分位排名
+    rs_universe_map = {}
+    # 2026-08-16 新增：「大盤相比(強/弱)」判斷用，記錄每一檔股票的 MA排列 與 RS創新高（原始布林值），
+    # 全市場掃描跑完、算出 RS Rating 後，再跟 RS Rating 一起丟進 classify_relative_strength() 統一判斷。
+    relative_strength_inputs = {}
+
     render_scan_progress_card(scan_progress_card_placeholder, 0, "掃描進度")
     progress_bar = st.progress(0, text=f"掃描進度：0.0%（準備掃描 {scan_total_count} 檔股票）")
     processed_count = 0
@@ -535,7 +582,10 @@ if should_run_scan:
 
                 price = get_last_price_by_source(symbol, df, st.session_state.fubon_sdk, active_price_source)
                 stock_name = get_stock_name(symbol, st.session_state.fubon_sdk)
-                data = compute_indicators(df, price, symbol=symbol, name=stock_name, rise_threshold=rise_threshold)
+                data = compute_indicators(
+                    df, price, symbol=symbol, name=stock_name, rise_threshold=rise_threshold,
+                    benchmark_ctx=benchmark_ctx, benchmark_df=benchmark_df,
+                )
 
                 signal_types = data["signal_types"]
                 signal_kinds = data["signal_kinds"]
@@ -568,17 +618,36 @@ if should_run_scan:
 
                 valid_stock_stats.append({"symbol": symbol, "code": symbol_to_code(symbol), "name": stock_name, "pct": float(data["pct"])})
 
+                # RS Rating 用：記錄本次掃描每一檔「成功抓到資料」股票的 RS超額報酬%，
+                # 不受「只顯示訊號股票」等篩選條件影響，全市場掃描完後才統一算百分位排名。
+                if data.get("rs_excess") not in (None, "-"):
+                    rs_universe_map[symbol] = float(data["rs_excess"])
+                    relative_strength_inputs[symbol] = {
+                        "rs_excess": float(data["rs_excess"]),
+                        "ma_trend": data.get("ma_trend"),
+                        "rs_line_new_high": data.get("rs_line_new_high"),
+                    }
+
                 signal_direction_labels = []
                 if any(signal_kinds.get(s) == "buy" for s in signal_types): signal_direction_labels.append("買")
                 if any(signal_kinds.get(s) == "sell" for s in signal_types): signal_direction_labels.append("賣")
                 signal_direction_text = "/".join(signal_direction_labels) if signal_direction_labels else "-"
                 signal_detail_text = "；".join(f"{k}：{v}" for k, v in data["signal_details"].items())
 
+                rs_line_new_high_text = {True: "是", False: "否"}.get(data.get("rs_line_new_high"), "-")
+
                 row = {
                     "代碼": symbol, "代碼網址": yahoo_quote_url(symbol), "股票名稱": stock_name,
                     "價格": f"{data['price']:.2f}", "漲跌%": data["pct"], "成交量(張)": data["volume_lots"],
                     "波動率%": data["volatility_pct"], "RS加權報酬%": data["rs_raw"], "訊號分數": signal_score,
                     "追蹤等級": signal_grade, "MA位置": data["ma_range"], "MA排列": data["ma_trend"],
+                    # --- 2026-08-16 新增：個股 vs 大盤比較 ---
+                    "大盤MA位置": data.get("benchmark_ma_range", "-"), "大盤MA排列": data.get("benchmark_ma_trend", "-"),
+                    "RS超額報酬%": data.get("rs_excess", "-"),
+                    "RS Rating": "-",  # 全市場掃描跑完後才統一補上百分位排名 (見主迴圈結束後的 patch 區塊)
+                    "RS創新高": rs_line_new_high_text,
+                    "大盤相比(強/弱)": "-",  # 同上，需等 RS Rating 算完才能一起判斷 (見主迴圈結束後的 patch 區塊)
+                    # ------------------------------------------
                     "訊號方向": signal_direction_text,
                     "訊號類型": "、".join(_display_signal_type(s) for s in signal_types) if signal_types else "-",
                     "訊號說明": signal_detail_text if signal_detail_text else "-",
@@ -606,7 +675,7 @@ if should_run_scan:
                 error_stock_name = get_stock_name(symbol, st.session_state.fubon_sdk)
                 record_missing_stock(missing_stock_details, fetch_errors, symbol, error_stock_name, f"{type(e).__name__}: {e}", group_name, active_price_source)
                 if not show_only_signal_rows:
-                    rows.append({"代碼": symbol, "代碼網址": "", "股票名稱": error_stock_name, "價格": "錯誤", "漲跌%": "-", "成交量(張)": "-", "波動率%": "-", "RS加權報酬%": "-", "訊號分數": "-", "追蹤等級": "-", "MA位置": "-", "MA排列": "-", "訊號方向": "-", "訊號類型": "錯誤", "訊號說明": str(e), "來源": active_price_source})
+                    rows.append({"代碼": symbol, "代碼網址": "", "股票名稱": error_stock_name, "價格": "錯誤", "漲跌%": "-", "成交量(張)": "-", "波動率%": "-", "RS加權報酬%": "-", "訊號分數": "-", "追蹤等級": "-", "MA位置": "-", "MA排列": "-", "大盤MA位置": "-", "大盤MA排列": "-", "RS超額報酬%": "-", "RS Rating": "-", "RS創新高": "-", "大盤相比(強/弱)": "-", "訊號方向": "-", "訊號類型": "錯誤", "訊號說明": str(e), "來源": active_price_source})
 
         group_tables[group_name] = {"count": len(stocks), "table": pd.DataFrame(rows)}
         group_up_summary.append({
@@ -614,6 +683,49 @@ if should_run_scan:
             "前三名HTML": build_top3_html(valid_stock_stats), "上漲數": up_count, "下跌數": down_count,
             "平盤數": flat_count, "錯誤數": error_count, "總數": len(stocks)
         })
+
+    # ===== RS Rating：本次掃描全市場的 RS超額報酬% 百分位排名 (0~100，100=本次掃描最強) =====
+    # 必須等全部分組、全部股票都掃描完才能算 (要跟整個母體比較)，所以放在雙層迴圈結束後、
+    # 統一回填進 group_tables 的 DataFrame、all_signal_rows 與 signal_buckets 的 row 清單。
+    # 同一次掃描全部股票的「大盤RS基準值」都一樣，所以排名結果其實等同直接排
+    # RS加權報酬%，只是轉成 0~100 的百分位分數方便跨掃描時段比較。
+    if rs_universe_map:
+        rs_rating_map = (pd.Series(rs_universe_map).rank(pct=True) * 100).round(1).to_dict()
+    else:
+        rs_rating_map = {}
+
+    # ===== 大盤相比(強/弱)：同樣要等 RS Rating 算完才能綜合判斷，跟上面 RS Rating 一起回填 =====
+    # 大盤自己的 MA排列（benchmark_ma_trend）整次掃描只有一個值，直接從 benchmark_ctx 取，
+    # 不需要跟 rs_excess/ma_trend 一樣逐檔記錄。
+    _benchmark_ma_trend = benchmark_ctx.get("ma_trend") if benchmark_ctx else None
+    relative_strength_map = {}
+    for _symbol, _inputs in relative_strength_inputs.items():
+        relative_strength_map[_symbol] = classify_relative_strength(
+            rs_excess=_inputs["rs_excess"],
+            rs_rating=rs_rating_map.get(_symbol),
+            ma_trend=_inputs["ma_trend"],
+            benchmark_ma_trend=_benchmark_ma_trend,
+            rs_line_new_high=_inputs["rs_line_new_high"],
+        )
+
+    def _apply_rs_rating_to_rows(rows_list):
+        for r in rows_list:
+            val = rs_rating_map.get(r.get("代碼"))
+            r["RS Rating"] = val if val is not None else "-"
+            r["大盤相比(強/弱)"] = relative_strength_map.get(r.get("代碼"), "-")
+
+    for _info in group_tables.values():
+        _df = _info.get("table")
+        if _df is not None and not _df.empty and "代碼" in _df.columns:
+            _info["table"] = _df.assign(**{
+                "RS Rating": _df["代碼"].map(rs_rating_map),
+                "大盤相比(強/弱)": _df["代碼"].map(relative_strength_map),
+            })
+            _info["table"]["RS Rating"] = _info["table"]["RS Rating"].apply(lambda v: v if pd.notna(v) else "-")
+            _info["table"]["大盤相比(強/弱)"] = _info["table"]["大盤相比(強/弱)"].apply(lambda v: v if pd.notna(v) else "-")
+    _apply_rs_rating_to_rows(all_signal_rows)
+    for _bucket_rows in signal_buckets.values():
+        _apply_rs_rating_to_rows(_bucket_rows)
 
     render_scan_progress_card(scan_progress_card_placeholder, 100, "掃描進度")
     progress_bar.empty()
@@ -628,6 +740,17 @@ if should_run_scan:
         "fetch_errors": fetch_errors, "excel_filename": f"TWstock_signal_scan_{tw_now.strftime('%Y%m%d_%H%M%S')}.xlsx",
         "scan_completed_at": tw_now.strftime('%Y-%m-%d %H:%M:%S'), "progress_pct": 100, "min_volume_lots": min_volume_lots,
     }
+
+    # 把本次掃描命中的訊號股票清單寫進 twse_ohlcv.db 的 signal_scan_results 表，
+    # 讓 Stock simulator 的「📋 掃描結果瀏覽」可以直接讀取，不用另外匯出/匯入檔案。
+    # 寫入失敗（例如資料庫被其他程式鎖住）不影響掃描本身已完成的結果，只顯示警告。
+    try:
+        saved_count = db_utils.save_scan_results(DB_PATH, all_signal_rows, signal_buckets, scan_today_str)
+        st.session_state["last_scan_db_saved"] = saved_count
+    except Exception as e:
+        st.session_state["last_scan_db_saved"] = None
+        st.warning(f"⚠️ 掃描結果寫入資料庫失敗（不影響本次掃描結果本身）：{e}")
+
     if AUTO_UPLOAD_GITHUB:
         upload_file_to_github(build_signal_excel_bytes(signal_buckets), f"{GITHUB_DATABASE_DIR}/{st.session_state.last_scan_result['excel_filename']}", f"Auto upload TW stock scan result {tw_now.strftime('%Y-%m-%d %H:%M:%S')}")
         if os.path.exists(TRACKING_FILE): upload_tracking_file_to_github(tw_now.strftime('%Y-%m-%d %H:%M:%S'))
@@ -692,7 +815,7 @@ if fetch_errors:
     with st.expander(f"🔧 抓取/處理失敗除錯資訊（{len(fetch_errors)} 檔）", expanded=False):
         st.json(dict(list(fetch_errors.items())[:100]))
 
-display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "訊號分數", "追蹤等級", "MA位置", "MA排列", "訊號方向", "訊號類型", "來源"]
+display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "訊號方向", "訊號類型", "大盤相比(強/弱)", "波動率%", "RS創新高", "RS Rating", "MA位置", "MA排列", "RS加權報酬%", "RS超額報酬%", "訊號分數", "追蹤等級", "大盤MA位置", "大盤MA排列", "來源"]
 
 if all_signal_rows:
     signal_display_df = pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"]).copy()
@@ -706,6 +829,8 @@ if all_signal_rows:
         "代碼": st.column_config.LinkColumn("代碼", display_text=r"https://tw.stock.yahoo.com/quote/(.*)"),
         "股票名稱": st.column_config.TextColumn("股票名稱"),
         "訊號分數": st.column_config.NumberColumn("訊號分數", format="%.1f"),
+        "RS Rating": st.column_config.NumberColumn("RS Rating", format="%.1f", help="本次掃描全市場 RS超額報酬% 的百分位排名 (0~100，100=本次掃描最強)"),
+        "大盤相比(強/弱)": st.column_config.TextColumn("大盤相比(強/弱)", help="綜合 RS超額報酬%／RS Rating／MA排列(個股vs大盤)／RS創新高 四項訊號的簡化判斷：強／持平／弱"),
     })
 
     st.markdown("### 📑 依訊號分頁查看")
@@ -728,6 +853,7 @@ if all_signal_rows:
                     "代碼": st.column_config.LinkColumn("代碼", display_text=r"https://tw.stock.yahoo.com/quote/(.*)"),
                     "股票名稱": st.column_config.TextColumn("股票名稱"),
                     "訊號分數": st.column_config.NumberColumn("訊號分數", format="%.1f"),
+                    "RS Rating": st.column_config.NumberColumn("RS Rating", format="%.1f", help="本次掃描全市場 RS超額報酬% 的百分位排名 (0~100，100=本次掃描最強)"),
                 })
             else:
                 st.caption(f"目前沒有符合「{display_name}」的股票。")
@@ -751,6 +877,8 @@ for group_name, info in group_tables.items():
         "代碼": st.column_config.LinkColumn("代碼", display_text=r"https://tw.stock.yahoo.com/quote/(.*)"),
         "股票名稱": st.column_config.TextColumn("股票名稱"),
         "訊號分數": st.column_config.NumberColumn("訊號分數", format="%.1f"),
+        "RS Rating": st.column_config.NumberColumn("RS Rating", format="%.1f", help="本次掃描全市場 RS超額報酬% 的百分位排名 (0~100，100=本次掃描最強)"),
+        "大盤相比(強/弱)": st.column_config.TextColumn("大盤相比(強/弱)", help="綜合 RS超額報酬%／RS Rating／MA排列(個股vs大盤)／RS創新高 四項訊號的簡化判斷：強／持平／弱"),
     })
     st.markdown('<div style="margin-bottom: 10px;"></div>', unsafe_allow_html=True)
 

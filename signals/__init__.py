@@ -28,7 +28,7 @@ from signal_module import module_loader
 from signal_module.base import SIGNAL_REGISTRY, SignalContext as ModuleSignalContext, SignalResult
 from signal_module.indicators import add_indicators
 
-from .context import build_base_context
+from .context import build_base_context, build_relative_strength_fields, calc_rs_line_new_high
 
 # 啟動時（本 process 第一次 import 這個套件時）載入一次預設訊號模組。
 # 之後若在「🛠️ 訊號編輯」頁面存檔，會直接呼叫 module_loader.load_default_signal_modules()
@@ -84,12 +84,17 @@ def run_signal_registry(symbol: str, name: str, df_ind: pd.DataFrame, scan_date:
     return results
 
 
-def compute_indicators(df, price, symbol="", name="", rise_threshold=5.0):
+def compute_indicators(df, price, symbol="", name="", rise_threshold=5.0, benchmark_ctx=None, benchmark_df=None, rs_line_lookback=60):
     """
     主流程呼叫入口：
     1. 計算表格/評分共用的基礎數值 (價格/漲跌/MA位置/成交量/波動率/RS)
     2. 補上今日即時價並計算 K/D/MA/Bias/BBand 等技術指標
     3. 跑過訊號登記表，收集所有命中的訊號
+    4.（2026-08-16 新增）個股 vs 大盤比較：大盤MA位置/大盤MA排列/RS超額報酬%/RS Line創新高。
+       benchmark_ctx / benchmark_df 由主程式在單次掃描開始前算好一次、全部股票共用傳入；
+       兩者皆為 None（例如大盤資料抓取失敗）時，比較欄位一律回傳 "-"，不影響其餘既有邏輯。
+       RS Rating（全市場百分位排名）需要整批掃描結果才能算，不在這裡處理，由主程式在
+       全部股票掃描完後統一計算。
     """
     base = build_base_context(df, price)
     df_ind = _prepare_indicator_df(df, price)
@@ -113,6 +118,14 @@ def compute_indicators(df, price, symbol="", name="", rise_threshold=5.0):
         for key in hit_keys
     }
 
+    rs_fields = build_relative_strength_fields(base, benchmark_ctx)
+    rs_line_new_high = None
+    if benchmark_df is not None and not benchmark_df.empty:
+        try:
+            rs_line_new_high = calc_rs_line_new_high(df, base["price"], benchmark_df, lookback=rs_line_lookback)
+        except Exception:
+            rs_line_new_high = None
+
     return {
         "price": round(base["price"], 2),
         "pct": round(base["pct"], 2),
@@ -129,6 +142,12 @@ def compute_indicators(df, price, symbol="", name="", rise_threshold=5.0):
         "MA10": _safe_round_or_none(latest_row.get("MA10"), 2),
         "MA20": _safe_round_or_none(latest_row.get("MA20"), 2),
         "VolRatioYesterday": _safe_round_or_none(latest_row.get("VolRatioYesterday"), 4),
+        # ------------------------------------------------------------------
+        # --- 2026-08-16 新增：個股 vs 大盤比較（詳見 signals/context.py 說明）---
+        "benchmark_ma_range": rs_fields["benchmark_ma_range"],
+        "benchmark_ma_trend": rs_fields["benchmark_ma_trend"],
+        "rs_excess": round(rs_fields["rs_excess"], 2) if rs_fields["rs_excess"] is not None else "-",
+        "rs_line_new_high": rs_line_new_high,  # True / False / None(資料不足，無法判斷)
         # ------------------------------------------------------------------
         "signal_types": signal_types,
         "signal_kinds": signal_kinds,

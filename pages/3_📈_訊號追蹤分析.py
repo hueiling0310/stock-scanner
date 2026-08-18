@@ -41,8 +41,8 @@ except Exception:  # pragma: no cover
 
 st.set_page_config(page_title="訊號追蹤分析", layout="wide")
 
-DEFAULT_OWNER = "henglunlin"
-DEFAULT_REPO = "stock-scanner-FUBAN"
+DEFAULT_OWNER = "hueiling0310"
+DEFAULT_REPO = "stock-scanner"
 DEFAULT_BRANCH = "main"
 DEFAULT_DATABASE_DIR = "Database"
 TRACKING_PREFIX = "signal_tracking"
@@ -250,8 +250,31 @@ def calc_max_drawdown(lows: pd.Series, entry_price: float) -> Optional[float]:
     return round((float(lows.min()) / entry_price - 1) * 100, 2)
 
 
-def classify_success(max_gain: float, max_drawdown: float, close_return: float) -> int:
+def classify_profitable(close_return: Optional[float]) -> Optional[int]:
+    """5 日報酬是否為正（不管過程中回撤多少），作為主要、較直覺的『有賺錢』指標。"""
+    if close_return is None:
+        return None
+    return int(close_return > 0)
+
+
+def classify_clean_win(max_gain: Optional[float], max_drawdown: Optional[float], close_return: Optional[float]) -> Optional[int]:
+    """較嚴格的定義：達到滿意漲幅、過程沒有明顯拉回、且收盤仍是正報酬。
+    用來衡量『進場後走勢乾不乾淨』，跟 classify_profitable 是互補的兩個指標，不是取代關係。"""
+    if max_gain is None or max_drawdown is None or close_return is None:
+        return None
     return int(max_gain >= 5 and max_drawdown > -5 and close_return >= 2)
+
+
+# entry_price 跟 yfinance 實際股價差距超過這個倍數，視為資料異常（除權息斷點、資料源不一致、
+# 人工登錄錯誤等），不計算報酬，避免產生像 -90% 這種假的極端值污染統計。
+PRICE_SANITY_RATIO = 3.0
+
+
+def is_price_anomaly(entry_price: float, reference_price: Optional[float]) -> bool:
+    if reference_price is None or reference_price <= 0 or entry_price <= 0:
+        return False
+    ratio = entry_price / reference_price
+    return ratio > PRICE_SANITY_RATIO or ratio < (1 / PRICE_SANITY_RATIO)
 
 
 def update_forward_performance(df: pd.DataFrame, max_days: int = 20, period: str = "6mo") -> pd.DataFrame:
@@ -259,6 +282,7 @@ def update_forward_performance(df: pd.DataFrame, max_days: int = 20, period: str
         return df
     out = df.copy()
     result_rows = []
+    anomaly_symbols: List[str] = []
     symbols = sorted(out["代碼"].dropna().unique().tolist())
     progress = st.progress(0, text="準備下載股價資料...")
     price_map: Dict[str, pd.DataFrame] = {}
@@ -282,6 +306,18 @@ def update_forward_performance(df: pd.DataFrame, max_days: int = 20, period: str
         if future.empty:
             result_rows.append(r)
             continue
+
+        # 資料防呆：entry_price 應該跟掃描日附近的實際股價同一個量級。
+        # 用「scan_date 當天或最近一個交易日」的收盤價比對；若掃描日早於下載區間起點，
+        # 退回用 future 的第一筆收盤價比對。
+        before = hist[hist.index <= scan_date]
+        reference_price = float(before["Close"].iloc[-1]) if not before.empty else float(future["Close"].iloc[0])
+        if is_price_anomaly(entry_price, reference_price):
+            r["status"] = "資料異常"
+            anomaly_symbols.append(f"{symbol}（entry_price={entry_price} vs 實際股價≈{reference_price:.2f}）")
+            result_rows.append(r)
+            continue
+
         closes, highs, lows = future["Close"], future["High"], future["Low"]
         r["days_tracked"] = len(future)
         for d in [1, 3, 5, 10, 20]:
@@ -293,11 +329,20 @@ def update_forward_performance(df: pd.DataFrame, max_days: int = 20, period: str
         r["max_drawdown_10d%"] = calc_max_drawdown(lows.head(10), entry_price)
         r["max_gain_20d%"] = calc_max_gain(highs.head(20), entry_price)
         r["max_drawdown_20d%"] = calc_max_drawdown(lows.head(20), entry_price)
-        r["is_success_5d"] = classify_success(
-            safe_float(r.get("max_gain_5d%", 0)), safe_float(r.get("max_drawdown_5d%", 0)), safe_float(r.get("return_5d%", 0))
+        r["is_profitable_5d"] = classify_profitable(r.get("return_5d%"))
+        r["is_clean_win_5d"] = classify_clean_win(
+            r.get("max_gain_5d%"), r.get("max_drawdown_5d%"), r.get("return_5d%")
         )
+        # 保留舊欄位名，維持既有 CSV schema 與下游相容性。
+        r["is_success_5d"] = r["is_clean_win_5d"]
         r["status"] = "done" if len(future) >= 10 else "tracking"
         result_rows.append(r)
+
+    if anomaly_symbols:
+        st.warning(
+            f"已排除 {len(anomaly_symbols)} 筆疑似資料異常的訊號（entry_price 與實際股價差距過大，"
+            f"不計入報酬與統計）：\n" + "\n".join(anomaly_symbols)
+        )
     return pd.DataFrame(result_rows)
 
 
@@ -703,12 +748,21 @@ if symbols_text.strip():
     symbols = [normalize_symbol(x) for x in symbols_text.replace("，", ",").split(",") if x.strip()]
     filtered = filtered[filtered["代碼"].isin(symbols)]
 
-k1, k2, k3, k4, k5 = st.columns(5)
+k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.metric("訊號筆數", f"{len(filtered):,}")
 k2.metric("股票數", f"{filtered['代碼'].nunique():,}" if "代碼" in filtered.columns else "0")
 k3.metric("5D平均報酬", f"{filtered['return_5d%'].dropna().mean():.2f}%" if "return_5d%" in filtered.columns and filtered["return_5d%"].notna().any() else "未更新")
 k4.metric("5D平均最高漲幅", f"{filtered['max_gain_5d%'].dropna().mean():.2f}%" if "max_gain_5d%" in filtered.columns and filtered["max_gain_5d%"].notna().any() else "未更新")
-k5.metric("5D成功率", f"{filtered['is_success_5d'].mean():.2%}" if "is_success_5d" in filtered.columns and filtered["is_success_5d"].notna().any() else "未更新")
+k5.metric(
+    "5D 獲利率",
+    f"{filtered['is_profitable_5d'].mean():.2%}" if "is_profitable_5d" in filtered.columns and filtered["is_profitable_5d"].notna().any() else "未更新",
+    help="5 日後收盤報酬是否為正，不管過程中回撤多少。",
+)
+k6.metric(
+    "5D 乾淨獲利率",
+    f"{filtered['is_clean_win_5d'].mean():.2%}" if "is_clean_win_5d" in filtered.columns and filtered["is_clean_win_5d"].notna().any() else "未更新",
+    help="較嚴格：5日內最高漲幅≥5%、過程回撤未超過5%、且收盤報酬≥2%。",
+)
 
 st.subheader("績效摘要")
 tab1, tab2, tab3, tab4 = st.tabs(["依追蹤等級", "依訊號類型", "依MA排列", "明細資料"])
@@ -717,7 +771,7 @@ def summary_group(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
     if group_col not in df.columns:
         return pd.DataFrame()
     agg_dict: Dict[str, Tuple[str, str]] = {"筆數": ("代碼", "count")}
-    for col in ["return_3d%", "return_5d%", "return_10d%", "max_gain_5d%", "max_drawdown_5d%", "is_success_5d"]:
+    for col in ["return_3d%", "return_5d%", "return_10d%", "max_gain_5d%", "max_drawdown_5d%", "is_profitable_5d", "is_clean_win_5d"]:
         if col in df.columns:
             agg_dict[col] = (col, "mean")
     return df.groupby(group_col, dropna=False).agg(**agg_dict).reset_index().sort_values("筆數", ascending=False)
@@ -734,7 +788,7 @@ with tab2:
 with tab3:
     st.dataframe(summary_group(filtered, "MA排列"), use_container_width=True)
 with tab4:
-    show_cols = [c for c in ["scan_date", "代碼", "股票名稱", "entry_price", "訊號分數", "追蹤等級", "訊號類型", "return_1d%", "return_3d%", "return_5d%", "return_10d%", "return_20d%", "max_gain_5d%", "max_drawdown_5d%", "MA位置", "MA排列", "RS加權報酬%", "source_file"] if c in filtered.columns]
+    show_cols = [c for c in ["scan_date", "代碼", "股票名稱", "entry_price", "訊號分數", "追蹤等級", "訊號類型", "return_1d%", "return_3d%", "return_5d%", "return_10d%", "return_20d%", "max_gain_5d%", "max_drawdown_5d%", "is_profitable_5d", "is_clean_win_5d", "status", "MA位置", "MA排列", "RS加權報酬%", "source_file"] if c in filtered.columns]
     st.dataframe(filtered[show_cols].sort_values(["scan_date", "訊號分數"], ascending=[False, False]), use_container_width=True)
 
 st.subheader("匯出 / 回寫")

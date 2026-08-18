@@ -257,7 +257,11 @@ def download_stock_data_yfinance_history(symbol: str, today_str: str):
             return pd.DataFrame()
         today = pd.to_datetime(today_str).date()
         return df[df["Date"] < today].reset_index(drop=True)
-    except Exception:
+    except Exception as e:
+        # 2026-08-16 新增：這裡原本是完全靜默的 except，抓不到資料時使用者/開發者
+        # 完全看不出真正原因（限流429、Yahoo改介面、代碼錯誤...都長一樣）。
+        # 印出來至少能在 Streamlit Cloud 的 "Manage app" 日誌裡看到真正的錯誤訊息。
+        print(f"yfinance 歷史資料抓取失敗 ({symbol}): {type(e).__name__}: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=REFRESH_SEC)
@@ -271,7 +275,8 @@ def download_stock_data_yfinance_today(symbol: str, today_str: str):
             return pd.DataFrame()
         today = pd.to_datetime(today_str).date()
         return df[df["Date"] >= today].reset_index(drop=True)
-    except Exception:
+    except Exception as e:
+        print(f"yfinance 今日資料抓取失敗 ({symbol}): {type(e).__name__}: {e}")
         return pd.DataFrame()
 
 # ==========================================
@@ -313,17 +318,23 @@ def bulk_download_db_history(symbols: tuple, today_str: str) -> dict:
     """批次從本地 SQLite 抓取歷史資料，大幅提升全市場掃描速度"""
     db_path = _get_db_path()
     if not os.path.exists(db_path) or not symbols:
+        # 2026-08-16 新增：這裡原本完全靜默——DB 檔案不存在時，全部股票會「同時」
+        # 從本地資料庫讀不到任何歷史資料，只能默默退回逐檔即時抓取(yfinance/富邦)。
+        # 印出來方便判斷「是 DB 真的不見了/路徑不對」還是「單純 yfinance 本身抓不到」。
+        if not os.path.exists(db_path):
+            print(f"本地資料庫批次讀取：找不到 DB 檔案 (path={os.path.abspath(db_path)})，本次掃描全部改用即時 API 抓取。")
         return {s: pd.DataFrame() for s in symbols}
-    
+
     codes = [str(s).split(".")[0] for s in symbols]
     placeholders = ",".join("?" * len(codes))
-    
+
     try:
         with sqlite3.connect(db_path) as conn:
             query = f"SELECT Date, Open, High, Low, Close, Volume, SecurityCode FROM ohlcv_data WHERE SecurityCode IN ({placeholders})"
             df = pd.read_sql(query, conn, params=codes)
-            
+
             if df.empty:
+                print(f"本地資料庫批次讀取：DB 檔案存在但查無任何符合的 SecurityCode（共查 {len(codes)} 檔），可能是 ohlcv_data 表是空的或代碼格式對不上。")
                 return {s: pd.DataFrame() for s in symbols}
             
             df["Date"] = pd.to_datetime(df["Date"]).dt.date
@@ -372,7 +383,12 @@ def bulk_download_yfinance_history(symbols: tuple, today_str: str) -> dict:
             tickers=list(symbols), period="4mo", interval="1d",
             auto_adjust=False, group_by="ticker", threads=True, progress=False,
         )
-    except Exception:
+    except Exception as e:
+        # 2026-08-16 新增：這裡原本是完全靜默的 except，一次批次抓上千檔股票的請求如果被
+        # Yahoo 限流(429)/擋掉，或 yfinance 內部改版導致回傳格式不對，全部股票會「同時」
+        # 抓不到資料，卻完全看不到任何錯誤訊息可以判斷原因。印出來至少能在 Streamlit Cloud
+        # 的 "Manage app" 日誌裡看到真正的錯誤，不用再靠使用者回報「今天全部都抓不到」用猜的。
+        print(f"yfinance 批次歷史資料抓取失敗（{len(symbols)} 檔）: {type(e).__name__}: {e}")
         return {s: pd.DataFrame() for s in symbols}
 
     today = pd.to_datetime(today_str).date()
@@ -391,11 +407,14 @@ def bulk_download_yfinance_today(symbols: tuple, today_str: str) -> dict:
             tickers=list(symbols), period="5d", interval="1d",
             auto_adjust=False, group_by="ticker", threads=True, progress=False,
         )
-    except Exception:
+    except Exception as e:
+        print(f"yfinance 批次今日資料抓取失敗（{len(symbols)} 檔）: {type(e).__name__}: {e}")
         return {s: pd.DataFrame() for s in symbols}
 
     today = pd.to_datetime(today_str).date()
     per_symbol = _split_yfinance_bulk_result(raw, symbols)
+    if raw is None or raw.empty:
+        print(f"yfinance 批次今日資料回傳為空（{len(symbols)} 檔，無例外訊息——可能是全部代碼當天皆無資料，或 Yahoo 端已靜默限流）。")
     return {
         s: (df[df["Date"] >= today].reset_index(drop=True) if not df.empty else df)
         for s, df in per_symbol.items()

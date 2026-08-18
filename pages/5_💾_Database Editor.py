@@ -10,6 +10,8 @@ import tempfile
 from datetime import datetime, timedelta
 from typing import Any
 
+import benchmark_utils
+
 # 停用忽略 SSL 所產生的警告訊息
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -93,32 +95,41 @@ def find_table(payload: dict[str, Any], required: set[str], min_columns: int = 0
 # ==========================================
 # 3. 核心資料處理
 # ==========================================
-def fetch_twse_daily(report_date: str) -> pd.DataFrame:
-    """抓取單日 [上市] OHLCV 資料"""
+def fetch_twse_daily(report_date: str, return_payload: bool = False):
+    """
+    抓取單日 [上市] OHLCV 資料。
+    return_payload=True 時改回傳 (df, payload) tuple——2026-08-17 新增：
+    讓呼叫端（主流程迴圈）可以把這裡已經打過一次的官方 MI_INDEX payload
+    直接轉給 benchmark_utils.update_benchmark_daily() 解析大盤指數，
+    不用為了大盤又對同一個官方端點多打一次一模一樣的請求，
+    降低被限流(429)的風險，也讓大盤同步更不容易失敗。
+    """
+    payload = None
     try:
         payload = get_json(TWSE_URL, {"date": report_date, "type": "ALLBUT0999", "response": "json"})
         if not check_status(payload, "prices"):
-            return pd.DataFrame()
-            
+            return (pd.DataFrame(), payload) if return_payload else pd.DataFrame()
+
         raw_df = find_table(payload, {SECURITY_CODE, CLOSE_PRICE})
-        
+
         target_cols = [SECURITY_CODE, SECURITY_NAME, OPEN_PRICE, HIGH_PRICE, LOW_PRICE, CLOSE_PRICE, VOLUME]
         df = raw_df[target_cols].copy()
-        
+
         df.columns = ["SecurityCode", "SecurityName", "Open", "High", "Low", "Close", "Volume"]
         df["SecurityCode"] = df["SecurityCode"].astype(str).str.strip()
         df["SecurityName"] = df["SecurityName"].astype(str).str.strip()
-        
+
         for col in ["Open", "High", "Low", "Close", "Volume"]:
             df[col] = df[col].map(number)
-            
+
         df.insert(0, "Date", pd.to_datetime(report_date, format="%Y%m%d").date())
         df.insert(1, "Market", "上市")
-        
-        return df[df["Close"] > 0].drop_duplicates("SecurityCode")
+
+        result_df = df[df["Close"] > 0].drop_duplicates("SecurityCode")
+        return (result_df, payload) if return_payload else result_df
     except Exception as e:
         st.warning(f"上市資料解析失敗 ({report_date}): {e}")
-        return pd.DataFrame()
+        return (pd.DataFrame(), payload) if return_payload else pd.DataFrame()
 
 def fetch_tpex_daily(report_date: str) -> pd.DataFrame:
     """抓取單日 [上櫃] OHLCV 資料"""
@@ -390,39 +401,57 @@ if start_btn and start_date <= end_date:
     
     all_data_frames = []
     logs = []
-    
+    total_benchmark_days = 0
+
     for i in range(total_days):
         date_str = current_date.strftime("%Y%m%d")
         status_text.text(f"正在處理: {date_str} ({i+1}/{total_days})")
-        
+
         try:
             # 分別抓取上市與上櫃資料
-            twse_df = fetch_twse_daily(date_str)
+            # 2026-08-17 修改：改用 return_payload=True 拿回原始 MI_INDEX payload，
+            # 下面同步大盤指數時可以直接複用，不用再多打一次官方 API。
+            twse_df, mi_payload = fetch_twse_daily(date_str, return_payload=True)
             time.sleep(1.5) # 在兩個請求之間稍微停頓，避免被當成惡意攻擊
             tpex_df = fetch_tpex_daily(date_str)
-            
+
             daily_df = pd.concat([twse_df, tpex_df], ignore_index=True)
-            
+
             if not daily_df.empty:
                 save_to_database(daily_df)
                 all_data_frames.append(daily_df)
                 logs.append(f"✅ {date_str}: 成功取得 {len(twse_df)}筆上市 + {len(tpex_df)}筆上櫃資料")
             else:
                 logs.append(f"⏸️ {date_str}: 假日或無交易資料，跳過")
-                
+
+            # 2026-08-16 新增：這裡跟 update_db.py 一樣抓官方 TWSE MI_INDEX 端點，
+            # 同步把「大盤（加權指數）」這天的收盤值也存進這個工具自己的 DB_NAME，
+            # 失敗不擋主流程，只是這天匯出的資料不會有大盤比較欄位可用。
+            # 2026-08-17 修改：優先用上面 fetch_twse_daily 已經抓到的 mi_payload 解析，
+            # 官方端點這次沒抓到（mi_payload 為 None 或解析不出來）時，
+            # update_benchmark_daily 內部才會自動 fallback 改打一次 yfinance。
+            try:
+                if benchmark_utils.update_benchmark_daily(DB_NAME, date_str, mi_index_payload=mi_payload):
+                    total_benchmark_days += 1
+                    logs.append(f"　　↳ 大盤指數同步成功")
+                else:
+                    logs.append(f"　　↳ ⚠️ 大盤指數這天沒抓到（官方端點與 yfinance 備援皆失敗）")
+            except Exception as e:
+                logs.append(f"　　↳ ⚠️ 大盤指數同步發生例外：{type(e).__name__}: {e}")
+
         except Exception as e:
             logs.append(f"❌ {date_str}: 發生整體錯誤 - {e}")
-            
+
         progress_bar.progress((i + 1) / total_days)
         log_area.code("\n".join(logs))
-        
+
         current_date += timedelta(days=1)
-        
+
         # 強制暫停 3 秒保護 IP
         if i < total_days - 1:
             time.sleep(3)
-            
-    st.success(f"🎉 抓取任務完成！資料已暫存於雲端的 {DB_NAME}")
+
+    st.success(f"🎉 抓取任務完成！資料已暫存於雲端的 {DB_NAME}（大盤指數同步 {total_benchmark_days}/{total_days} 天）")
     
     # 🌟 新增：提供下載本地端 DB 檔案的按鈕
     if os.path.exists(DB_NAME):

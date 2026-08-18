@@ -222,10 +222,31 @@ def calc_max_drawdown(lows: pd.Series, entry_price: float) -> Optional[float]:
     return round((float(lows.min()) / entry_price - 1) * 100, 2)
 
 
-def classify_success(max_gain: float, max_drawdown: float, close_return: float) -> int:
-    if max_gain >= 5 and max_drawdown > -5 and close_return >= 2:
-        return 1
-    return 0
+def classify_profitable(close_return: Optional[float]) -> Optional[int]:
+    """5 日報酬是否為正（不管過程中回撤多少），作為主要、較直覺的『有賺錢』指標。"""
+    if close_return is None:
+        return None
+    return int(close_return > 0)
+
+
+def classify_clean_win(max_gain: Optional[float], max_drawdown: Optional[float], close_return: Optional[float]) -> Optional[int]:
+    """較嚴格的定義：達到滿意漲幅、過程沒有明顯拉回、且收盤仍是正報酬。
+    用來衡量『進場後走勢乾不乾淨』，跟 classify_profitable 是互補的兩個指標，不是取代關係。"""
+    if max_gain is None or max_drawdown is None or close_return is None:
+        return None
+    return int(max_gain >= 5 and max_drawdown > -5 and close_return >= 2)
+
+
+# entry_price 跟 yfinance 實際股價差距超過這個倍數，視為資料異常（除權息斷點、資料源不一致、
+# 人工登錄錯誤等），不計算報酬，避免產生像 -90% 這種假的極端值污染統計。
+PRICE_SANITY_RATIO = 3.0
+
+
+def is_price_anomaly(entry_price: float, reference_price: Optional[float]) -> bool:
+    if reference_price is None or reference_price <= 0 or entry_price <= 0:
+        return False
+    ratio = entry_price / reference_price
+    return ratio > PRICE_SANITY_RATIO or ratio < (1 / PRICE_SANITY_RATIO)
 
 
 def normalize_yfinance_columns(hist: pd.DataFrame) -> pd.DataFrame:
@@ -279,6 +300,15 @@ def update_tracking_result() -> pd.DataFrame:
             result_rows.append(r)
             continue
 
+        # 資料防呆：entry_price 應該跟掃描日附近的實際股價同一個量級。
+        before = hist[hist.index <= scan_date]
+        reference_price = float(before["Close"].iloc[-1]) if not before.empty else float(future["Close"].iloc[0])
+        if is_price_anomaly(entry_price, reference_price):
+            print(f"[WARN] {symbol} 疑似資料異常：entry_price={entry_price} vs 實際股價≈{reference_price:.2f}，略過報酬計算")
+            r["status"] = "資料異常"
+            result_rows.append(r)
+            continue
+
         closes = future["Close"]
         highs = future["High"]
         lows = future["Low"]
@@ -291,11 +321,12 @@ def update_tracking_result() -> pd.DataFrame:
         r["max_drawdown_5d%"] = calc_max_drawdown(lows.head(5), entry_price)
         r["max_gain_10d%"] = calc_max_gain(highs.head(10), entry_price)
         r["max_drawdown_10d%"] = calc_max_drawdown(lows.head(10), entry_price)
-        r["is_success_5d"] = classify_success(
-            safe_float(r.get("max_gain_5d%", 0)),
-            safe_float(r.get("max_drawdown_5d%", 0)),
-            safe_float(r.get("return_5d%", 0)),
+        r["is_profitable_5d"] = classify_profitable(r.get("return_5d%"))
+        r["is_clean_win_5d"] = classify_clean_win(
+            r.get("max_gain_5d%"), r.get("max_drawdown_5d%"), r.get("return_5d%")
         )
+        # 保留舊欄位名，維持既有 CSV schema 與下游相容性。
+        r["is_success_5d"] = r["is_clean_win_5d"]
         r["status"] = "done" if len(future) >= 10 else "tracking"
         result_rows.append(r)
 
