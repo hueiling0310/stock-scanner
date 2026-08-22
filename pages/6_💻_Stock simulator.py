@@ -510,11 +510,6 @@ def save_to_database(db_path: str, df: pd.DataFrame):
     with sqlite3.connect(db_path, timeout=30.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         db_utils.ensure_indexes(conn)  # 確保 (SecurityCode, Date) 索引存在，下面的刪除/查詢才吃得到索引
-        # 2026-08-17 修正：journal_mode=WAL 是記錄在 .db 檔案本身、跨連線持續生效的設定，
-        # 這個檔案之後會被提交進 git repo，但 WAL 模式需要的 -wal/-shm side-car 檔案不會
-        # 一起被提交，導致 Streamlit Cloud 之後重新打開這個檔案時可能整個讀取失敗
-        # （這次「pandas.errors.DatabaseError」的根因）。寫入完成後主動切回 DELETE 模式，
-        # 避免把 WAL 模式留在被提交的 db 檔案裡；寫入當下仍保留 WAL 以避免鎖定問題。
 
         # 效能備註 (2026-08-12)：原本用 executemany 對「每一列」各發一條
         # DELETE ... WHERE Date=? AND SecurityCode=?，全市場更新時等於逐檔
@@ -537,9 +532,6 @@ def save_to_database(db_path: str, df: pd.DataFrame):
 
         # 寫入新資料
         df.to_sql("ohlcv_data", conn, if_exists="append", index=False)
-        conn.commit()
-        conn.execute("PRAGMA journal_mode=DELETE;")
-        conn.commit()
 
 
 # --------------------------------------------------------------------------
@@ -795,8 +787,32 @@ if st.session_state.get("journal_path") != journal_path:
 def _get_conn(path: str, mtime: float):
     return db_utils.get_connection(path)
 
-conn = _get_conn(db_path, os.path.getmtime(db_path))
-stock_list_df = db_utils.get_stock_list(conn)
+# 2026-08-22 新增：database disk image is malformed 容錯處理。
+# 這個錯誤通常發生在 Streamlit Cloud 容器裡——twse_ohlcv.db 被 git pull 更新到新版本，
+# 但同資料夾殘留的舊版 -wal/-shm 暫存檔沒有一起被換掉，導致 SQLite 打開時發現主檔案
+# 跟暫存檔對不上而回報「損毀」。db_utils.get_connection() 已經會自動偵測並清除這類
+# 過期的暫存檔重試一次；這裡是最後一道防線——如果自動修復仍然失敗，給使用者清楚的
+# 中文說明與重試按鈕，而不是讓整頁噴出原始 traceback。
+try:
+    conn = _get_conn(db_path, os.path.getmtime(db_path))
+    stock_list_df = db_utils.get_stock_list(conn)
+except Exception as e:
+    err_msg = str(e).lower()
+    if "malformed" in err_msg or "disk image" in err_msg:
+        st.error(
+            "❌ 資料庫檔案讀取失敗：database disk image is malformed\n\n"
+            "這通常代表 Streamlit Cloud 容器裡的 twse_ohlcv.db 跟殘留的暫存檔"
+            "（-wal / -shm）對不上，已嘗試自動清除暫存檔並重試一次仍然失敗。\n\n"
+            "請先點下方「清除快取並重試」；若還是失敗，代表容器內的檔案本身已損毀，"
+            "請到 Streamlit Cloud 的 Manage app 執行 Reboot app，讓它重新從 GitHub "
+            "clone 一份乾淨的 twse_ohlcv.db。"
+        )
+        if st.button("清除快取並重試"):
+            _get_conn.clear()
+            st.rerun()
+        st.stop()
+    else:
+        raise
 stock_options = [f"{r.SecurityCode} {r.SecurityName}" for r in stock_list_df.itertuples()]
 
 # 判斷目前選擇的股票 (提供給 yfinance 更新時參考)
