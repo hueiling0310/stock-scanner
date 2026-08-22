@@ -5,6 +5,7 @@ twse_ohlcv.db 存取工具
   Date (TEXT, YYYY-MM-DD), Market, SecurityCode, SecurityName,
   Open, High, Low, Close, Volume
 """
+import os
 import sqlite3
 import pandas as pd
 
@@ -35,8 +36,45 @@ def ensure_indexes(conn: sqlite3.Connection) -> None:
         pass
 
 
+def _remove_stale_wal_files(db_path: str) -> None:
+    """刪除跟主資料庫檔案內容對不上的 -wal / -shm 暫存檔 (不是 git 追蹤的檔案，
+    刪掉不會影響已經 commit 進 twse_ohlcv.db 的資料)。"""
+    for suffix in ("-wal", "-shm"):
+        stale_path = db_path + suffix
+        if os.path.exists(stale_path):
+            try:
+                os.remove(stale_path)
+            except OSError:
+                pass
+
+
 def get_connection(db_path: str) -> sqlite3.Connection:
+    """
+    開啟 twse_ohlcv.db 連線。
+
+    2026-08-22 新增容錯：Streamlit Cloud 部署時，容器裡的 twse_ohlcv.db 會因為
+    git pull 換成 repo 裡的新版本，但如果同一個資料夾還殘留著「舊版」寫入時留下的
+    -wal / -shm 暫存檔 (SQLite 在 WAL 模式下寫入會產生的暫存檔，不會被 git 追蹤)，
+    SQLite 打開檔案時會發現主檔案跟這兩個暫存檔的內容對不上，回報
+    "database disk image is malformed"，即使 twse_ohlcv.db 本體其實完全正常。
+    這裡開檔後先用 PRAGMA quick_check 驗證一次，遇到 malformed 就自動清掉這兩個
+    暫存檔並重試一次，通常就能自我修復，不需要手動到 Streamlit Cloud 按 Reboot app。
+    """
     conn = sqlite3.connect(db_path, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA quick_check")
+    except sqlite3.DatabaseError as e:
+        if "malformed" not in str(e).lower():
+            raise
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _remove_stale_wal_files(db_path)
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        # 這次如果還是壞的 (代表主檔案本體真的損毀，不是暫存檔的問題)，
+        # 就讓例外往上拋，讓呼叫端 (Stock simulator 頁面) 顯示明確的錯誤訊息。
+        conn.execute("PRAGMA quick_check")
     ensure_indexes(conn)
     return conn
 
