@@ -78,7 +78,8 @@ _REPO_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(_REPO_ROOT_DIR, "twse_ohlcv.db")
 DEFAULT_JOURNAL_PATH = os.path.join(_REPO_ROOT_DIR, "Trading Journal.xlsx")
 JOURNAL_LOG_SHEET = "log"
-JOURNAL_COLUMNS = ["交易日期", "股票代碼", "股票名稱", "進出場價格", "進出手法", "買賣張數", "Note"]
+JOURNAL_COLUMNS = ["交易日期", "股票代碼", "股票名稱", "進出場價格", "買賣方向", "進出手法", "買賣張數", "Note"]
+JOURNAL_ACTIONS = ["買入", "賣出"]
 JOURNAL_FONT_NAME = "微軟正黑體"
 JOURNAL_FONT_SIZE = 11
 JOURNAL_GITHUB_PATH = "Trading Journal.xlsx"  # 對應 GitHub repo 根目錄下的檔名
@@ -113,26 +114,68 @@ def journal_github_config():
     }
 
 
-def fetch_journal_bytes_from_github():
-    """從 GitHub repo 根目錄抓最新的 Trading Journal.xlsx 內容 (bytes)，抓不到回傳 None。"""
+def fetch_journal_meta_from_github():
+    """從 GitHub repo 根目錄抓最新的 Trading Journal.xlsx，回傳 {"bytes":..., "sha":...}，
+    抓不到回傳 None。sha 是這個版本在 GitHub 上的版本號，用於「儲存時偵測衝突」——見
+    upload_journal_to_github() 的 expected_sha 參數與 journal_editor_dialog() 的儲存流程。
+
+    2026-08-24 修正：原本用 raw.githubusercontent.com 抓檔案，這個網址背後是 GitHub 的
+    Fastly CDN，同一個 URL 預設會被快取數分鐘——跟這支 app 有沒有用 st.cache 完全無關，
+    純粹是 GitHub 那一層快取，所以剛推上去的新版檔案，用同一個網址抓下來還是可能拿到
+    快取的舊版本，造成「要等一段時間才讀到新的」。改用 GitHub Contents API
+    (api.github.com，跟 upload_journal_to_github() 拿 sha 用的是同一組 API) 不會被同一層
+    CDN 快取。若有設定 GITHUB_TOKEN 也一併帶上 Authorization，除了支援私有 repo，也能
+    避免撞到未登入 API 呼叫每小時 60 次的限制。
+
+    2026-08-28 修正：原本用 Accept: application/vnd.github.raw+json 直接拿 bytes，但這個
+    媒體類型的回應不會附帶 sha，沒辦法做衝突偵測；改回標準 JSON 回應 (含 content 的
+    base64 字串 + sha)，自己解 base64，換取能拿到 sha。
+    """
     cfg = journal_github_config()
+    token, owner, repo, branch = cfg["token"], cfg["owner"], cfg["repo"], cfg["branch"]
+    if not owner or not repo:
+        return None
     encoded_path = urllib.parse.quote(JOURNAL_GITHUB_PATH, safe="/")
-    url = f"https://raw.githubusercontent.com/{cfg['owner']}/{cfg['repo']}/{cfg['branch']}/{encoded_path}"
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{encoded_path}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Cache-Control": "no-cache",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
-        resp = requests.get(url, timeout=15)
+        resp = requests.get(url, headers=headers, params={"ref": branch}, timeout=15)
         if resp.status_code == 200:
-            return resp.content
+            data = resp.json()
+            content = base64.b64decode(data.get("content", ""))
+            return {"bytes": content, "sha": data.get("sha")}
     except Exception:
         pass
     return None
 
 
-def upload_journal_to_github(file_bytes: bytes, commit_message: str) -> bool:
-    """把交易紀錄 Excel 內容推回 GitHub repo 根目錄的 Trading Journal.xlsx (需要 GITHUB_TOKEN)。"""
+def fetch_journal_bytes_from_github():
+    """向下相容用途：只需要檔案內容 bytes、不需要 sha 時呼叫。"""
+    meta = fetch_journal_meta_from_github()
+    return meta["bytes"] if meta else None
+
+
+def upload_journal_to_github(file_bytes: bytes, commit_message: str, expected_sha: str = None, force: bool = False) -> dict:
+    """把交易紀錄 Excel 內容推回 GitHub repo 根目錄的 Trading Journal.xlsx (需要 GITHUB_TOKEN)。
+
+    回傳 {"success": bool, "sha": 這次推送後(或目前偵測到)的最新 sha, "conflict": bool}。
+
+    2026-08-28 新增併發保護：expected_sha 是使用者「上次讀取/清除快取」當下記住的版本號。
+    推送前重新抓一次 GitHub 目前的 sha，如果跟 expected_sha 不一樣，代表這份檔案在使用者
+    編輯期間已經被別人（或自己在別的裝置上）更新過，直接覆蓋會弄丟那個版本的內容——這裡
+    改成回傳 conflict=True 並中止推送，不再無聲覆蓋；force=True 時代表使用者已看過警告、
+    明確選擇要覆蓋，略過這個檢查（沿用原本「後存的人贏」的行為）。
+    """
     cfg = journal_github_config()
     token, owner, repo, branch = cfg["token"], cfg["owner"], cfg["repo"], cfg["branch"]
     if not token or not owner or not repo:
-        return False
+        return {"success": False, "sha": None, "conflict": False}
 
     encoded_path = urllib.parse.quote(JOURNAL_GITHUB_PATH, safe="/")
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{encoded_path}"
@@ -141,24 +184,28 @@ def upload_journal_to_github(file_bytes: bytes, commit_message: str) -> bool:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    sha = None
     try:
         get_res = requests.get(url, headers=headers, params={"ref": branch}, timeout=15)
-        if get_res.status_code == 200:
-            sha = get_res.json().get("sha")
+        current_sha = get_res.json().get("sha") if get_res.status_code == 200 else None
+
+        if not force and expected_sha and current_sha and expected_sha != current_sha:
+            return {"success": False, "sha": current_sha, "conflict": True}
 
         payload = {
             "message": commit_message,
             "content": base64.b64encode(file_bytes).decode("utf-8"),
             "branch": branch,
         }
-        if sha:
-            payload["sha"] = sha
+        if current_sha:
+            payload["sha"] = current_sha
 
         put_res = requests.put(url, headers=headers, json=payload, timeout=30)
-        return put_res.status_code in (200, 201)
+        if put_res.status_code in (200, 201):
+            new_sha = put_res.json().get("content", {}).get("sha")
+            return {"success": True, "sha": new_sha, "conflict": False}
+        return {"success": False, "sha": current_sha, "conflict": False}
     except Exception:
-        return False
+        return {"success": False, "sha": None, "conflict": False}
 
 
 def _stable_upload_path(uploaded_file, cache_key: str, tmp_prefix: str, tmp_filename: str) -> str:
@@ -185,6 +232,30 @@ def _stable_upload_path(uploaded_file, cache_key: str, tmp_prefix: str, tmp_file
     return path
 
 
+def classify_journal_action(method_text: str) -> str:
+    """依「進出手法」文字判斷買入/賣出的舊規則：
+    優先比對是否為系統既有的「賣出型」訊號 (SELL_LABELS，如 移動停利、跌停 等文字本身不含「賣」字)，
+    若不在清單內的自訂文字，才退回用「文字中是否含有『賣』字」判斷 (例如自訂輸入「反向3K反轉賣出」)。
+
+    2026-08-28：交易紀錄新增了獨立的「買賣方向」欄位後，這個函式不再是判斷方向的主要依據，
+    改當成「買賣方向」欄位缺漏時 (例如這個欄位加入之前的舊紀錄) 的自動回填規則，
+    見 load_journal_log() 與 match_journal_trades_fifo()。"""
+    text = str(method_text)
+    if text in SELL_LABELS:
+        return "賣出"
+    return "賣出" if "賣" in text else "買入"
+
+
+def resolve_journal_action(row) -> str:
+    """取得一筆交易紀錄的買賣方向：優先使用使用者在「買賣方向」欄位明確選的值，
+    只有這個欄位缺漏或不是合法值 (買入/賣出) 時，才退回用 classify_journal_action() 對
+    「進出手法」文字做猜測——主要是為了相容「買賣方向」欄位加入之前建立的舊紀錄。"""
+    action = row.get("買賣方向") if hasattr(row, "get") else None
+    if action in JOURNAL_ACTIONS:
+        return action
+    return classify_journal_action(row.get("進出手法") if hasattr(row, "get") else "")
+
+
 def load_journal_log(path: str) -> pd.DataFrame:
     """讀取交易紀錄 Excel 的 log 分頁，若檔案不存在或分頁不存在則回傳空表"""
     if not path or not os.path.exists(path):
@@ -199,18 +270,107 @@ def load_journal_log(path: str) -> pd.DataFrame:
     df = df[JOURNAL_COLUMNS].copy()
     df["交易日期"] = pd.to_datetime(df["交易日期"], errors="coerce").dt.strftime("%Y-%m-%d")
     df["買賣張數"] = pd.to_numeric(df["買賣張數"], errors="coerce")
+    # 「買賣方向」是 2026-08-28 新增的獨立方向欄位，取代原本純靠「進出手法」文字猜測買/賣的
+    # 做法。既有 (這個欄位加入之前) 的舊紀錄、或這欄被清空的紀錄，用 classify_journal_action()
+    # 自動回填一個預設值，使用者仍可在交易紀錄編輯器裡自行修正回填錯誤的筆數。
+    invalid_action = ~df["買賣方向"].isin(JOURNAL_ACTIONS)
+    if invalid_action.any():
+        df.loc[invalid_action, "買賣方向"] = df.loc[invalid_action, "進出手法"].apply(classify_journal_action)
     df = df.dropna(subset=["交易日期", "股票代碼"])
     return df.reset_index(drop=True)
 
 
-def classify_journal_action(method_text: str) -> str:
-    """判斷此筆記錄屬於買入或賣出：
-    優先比對是否為系統既有的「賣出型」訊號 (SELL_LABELS，如 移動停利、跌停 等文字本身不含「賣」字)，
-    若不在清單內的自訂文字，才退回用「文字中是否含有『賣』字」判斷 (例如自訂輸入「反向3K反轉賣出」)。"""
-    text = str(method_text)
-    if text in SELL_LABELS:
-        return "賣出"
-    return "賣出" if "賣" in text else "買入"
+def match_journal_trades_fifo(journal_for_stock: pd.DataFrame, latest_price):
+    """對單一股票的交易紀錄做「張數感知的 FIFO 配對」，回傳 (配對後的交易 list, 異常警告 list)。
+
+    每一筆買入視為一個持倉批次 (帶「剩餘張數」)，依日期排序後加入佇列尾端；遇到賣出時，
+    用賣出張數依先進先出、逐批扣減佇列最前面買入批次的剩餘張數，每扣一批就產生一筆
+    「已平倉」紀錄 (買入張數=賣出張數=實際成交的那部分)，該批買入剩餘張數歸零才會從佇列
+    移除，否則留在佇列繼續等下一筆賣出配對；一筆賣出可能跨多筆買入批次。迴圈跑完後，
+    佇列裡還有剩餘張數的批次一律視為「未平倉」，用 latest_price 計算未實現報酬率
+    (latest_price 為 None 時只標未平倉、不算報酬率)。「賣出張數超過目前持有張數」時
+    (理論上不該發生，除非紀錄本身缺漏買入或張數填錯) 不會硬湊配對產生假資料，
+    改成回傳一則警告文字讓呼叫端顯示提醒。"""
+    if journal_for_stock.empty:
+        return [], []
+
+    journal_sorted = journal_for_stock.copy()
+    journal_sorted["交易日期_dt"] = pd.to_datetime(journal_sorted["交易日期"], errors="coerce")
+    journal_sorted = journal_sorted.sort_values("交易日期_dt")
+
+    def _shares(row):
+        v = row.get("買賣張數")
+        try:
+            v = float(v)
+            if v > 0:
+                return v
+        except Exception:
+            pass
+        return 1.0  # 未填寫張數時，比對預設以 1 張計算
+
+    buy_queue = []  # 每筆: {"buy_date", "buy_method", "buy_price", "remaining"}
+    closed_trades = []
+    warnings = []
+
+    for _, jr in journal_sorted.iterrows():
+        action = resolve_journal_action(jr)
+        if action == "買入":
+            buy_queue.append({
+                "buy_date": jr["交易日期"], "buy_method": jr["進出手法"],
+                "buy_price": float(jr["進出場價格"]), "remaining": _shares(jr),
+            })
+        elif action == "賣出":
+            sell_remaining = _shares(jr)
+            sell_price = float(jr["進出場價格"])
+            if not buy_queue:
+                warnings.append(f"{jr['交易日期']} 賣出 {sell_remaining:g} 張，但目前沒有可配對的買入紀錄（可能漏登買入，或這筆賣出本身填錯）。")
+                continue
+            while sell_remaining > 1e-9 and buy_queue:
+                batch = buy_queue[0]
+                matched = min(sell_remaining, batch["remaining"])
+                pnl_pct = (sell_price - batch["buy_price"]) / batch["buy_price"] * 100 if batch["buy_price"] else 0
+                closed_trades.append({
+                    "買入日期": batch["buy_date"], "買入手法": batch["buy_method"],
+                    "買入張數": round(matched, 4), "買入價": batch["buy_price"],
+                    "賣出日期": jr["交易日期"], "賣出手法": jr["進出手法"],
+                    "賣出張數": round(matched, 4), "賣出價": sell_price,
+                    "狀態": "已平倉", "報酬率(%)": round(pnl_pct, 2),
+                })
+                batch["remaining"] -= matched
+                sell_remaining -= matched
+                if batch["remaining"] <= 1e-9:
+                    buy_queue.pop(0)
+            if sell_remaining > 1e-9:
+                warnings.append(f"{jr['交易日期']} 賣出張數超過目前持有張數，還有 {sell_remaining:g} 張賣出紀錄配對不到買入（可能漏登買入，或張數填錯）。")
+
+    open_trades = []
+    for batch in buy_queue:
+        if batch["remaining"] <= 1e-9:
+            continue
+        pnl_pct = None
+        if latest_price is not None and batch["buy_price"]:
+            pnl_pct = round((latest_price - batch["buy_price"]) / batch["buy_price"] * 100, 2)
+        open_trades.append({
+            "買入日期": batch["buy_date"], "買入手法": batch["buy_method"],
+            "買入張數": round(batch["remaining"], 4), "買入價": batch["buy_price"],
+            "賣出日期": "-", "賣出手法": "-", "賣出張數": None, "賣出價": None,
+            "狀態": "未平倉", "報酬率(%)": pnl_pct,
+        })
+
+    all_trades = closed_trades + open_trades
+    all_trades.sort(key=lambda t: t["買入日期"])
+    return all_trades, warnings
+
+
+def latest_close_price_for_code(conn, code: str):
+    """取得某股票在 DB 裡最新一筆收盤價，查不到回傳 None (供交易紀錄績效總表計算未平倉部位用)。"""
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT Close FROM ohlcv_data WHERE SecurityCode = ? ORDER BY Date DESC LIMIT 1", (str(code),))
+        row = cur.fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+    except Exception:
+        return None
 
 
 def save_journal_log(path: str, log_df: pd.DataFrame):
@@ -243,7 +403,52 @@ def save_journal_log(path: str, log_df: pd.DataFrame):
 
 @st.dialog("📝 交易紀錄編輯器 (Trading Journal)", width="large")
 def journal_editor_dialog():
-    st.caption(f"編輯目前讀取的檔案: {st.session_state.get('journal_path', DEFAULT_JOURNAL_PATH)}")
+    active_journal_path = st.session_state.get("journal_path", DEFAULT_JOURNAL_PATH)
+    cap_col, refresh_col = st.columns([5, 1])
+    cap_col.caption(f"編輯目前讀取的檔案: {active_journal_path}")
+    # 「清除快取」按鈕：只有目前讀取的是預設路徑 (對應 GitHub repo 的 Trading Journal.xlsx)
+    # 才有意義——側邊欄自行上傳的檔案本來就不會跟 GitHub 同步，沒有「快取」可清。
+    # 平常開啟編輯器時已經會自動抓一次 GitHub 最新版 (見下方側邊欄按鈕邏輯)，這顆按鈕是
+    # 讓使用者在編輯器「已經開著」的情況下，不用關掉重開，也能手動強制重新抓取最新內容，
+    # 例如剛在其他地方存檔、想立刻確認這裡有沒有同步到。
+    if active_journal_path == DEFAULT_JOURNAL_PATH:
+        if refresh_col.button(
+            "🔄 清除快取", use_container_width=True, key="journal_clear_cache_btn",
+            help="強制重新從 GitHub 抓取最新的 Trading Journal.xlsx，忽略任何快取",
+        ):
+            with st.spinner("正在清除快取並重新從 GitHub 抓取最新交易紀錄..."):
+                meta = fetch_journal_meta_from_github()
+            if meta:
+                try:
+                    with open(DEFAULT_JOURNAL_PATH, "wb") as f:
+                        f.write(meta["bytes"])
+                    st.session_state.journal_log_df = load_journal_log(DEFAULT_JOURNAL_PATH)
+                    st.session_state.journal_github_sha = meta["sha"]
+                    # 剛拿到最新版本，之前偵測到的儲存衝突(如果有)已經不成立了，重設掉。
+                    st.session_state.journal_save_conflict = False
+                    # st.data_editor 的編輯狀態是依 key ("journal_editor_widget") 快取的，
+                    # 光是換掉底層資料不會自動重置畫面上的內容，這裡明確清掉該 key，
+                    # 讓表格改用剛抓到的最新資料重繪，不會停留在原本(可能是舊的)畫面上。
+                    st.session_state.pop("journal_editor_widget", None)
+                    st.toast("已清除快取，成功抓取 GitHub 最新版本！", icon="✅")
+                    st.rerun()
+                except Exception as e:
+                    st.warning(f"⚠️ 抓到最新內容，但寫入本機失敗：{e}")
+            else:
+                st.warning(
+                    "⚠️ 清除快取失敗：無法從 GitHub 取得最新的 Trading Journal.xlsx"
+                    "（可能是網路問題，或 GITHUB_TOKEN／repo 設定有誤）。目前畫面仍是上次讀取的版本。"
+                )
+
+    # 儲存時若偵測到衝突 (見下方「儲存並關閉」流程)，會把這個 flag 設成 True，
+    # 這裡在對話框最上方持續顯示警告，直到使用者清除快取重新整理、或選擇強制覆蓋儲存為止。
+    if st.session_state.get("journal_save_conflict"):
+        st.warning(
+            "⚠️ 這份交易紀錄在你編輯期間，已經被別人（或你自己在別的裝置上）更新並存回 GitHub，"
+            "直接儲存會蓋掉那個版本。建議先按上方「🔄 清除快取」重新抓取最新版本，"
+            "確認不會弄丟別處的紀錄，再把你的編輯內容補回去；如果你確定要用目前畫面上的內容"
+            "覆蓋掉 GitHub 上的版本，可以在下方按「強制覆蓋儲存」。"
+        )
 
     # 股票代碼→名稱對照表 (供「股票代碼」欄位可搜尋選單 + 自動帶入「股票名稱」欄位使用)
     code_to_name = dict(zip(stock_list_df["SecurityCode"], stock_list_df["SecurityName"])) if not stock_list_df.empty else {}
@@ -269,7 +474,7 @@ def journal_editor_dialog():
     edit_source["交易日期"] = pd.to_datetime(edit_source["交易日期"], errors="coerce")
     # 文字欄位在資料為空時 pandas 會推斷成 float(NaN) 型別，與 TextColumn/SelectboxColumn 不相容，
     # 這裡明確轉為 string 型別避免 StreamlitAPIException
-    for _col in ["股票代碼", "股票名稱", "進出手法", "Note"]:
+    for _col in ["股票代碼", "股票名稱", "買賣方向", "進出手法", "Note"]:
         edit_source[_col] = edit_source[_col].astype("string")
     edit_source["買賣張數"] = pd.to_numeric(edit_source["買賣張數"], errors="coerce")
     # 這裡刻意 .astype(float)：如果目前紀錄裡的價格剛好都是整數 (例如 100、250)，
@@ -288,6 +493,7 @@ def journal_editor_dialog():
             "股票代碼": st.column_config.SelectboxColumn("股票代碼 (可搜尋)", options=stock_code_options, required=True),
             "股票名稱": st.column_config.TextColumn("股票名稱 (依代碼自動帶入)", disabled=True),
             "進出場價格": st.column_config.NumberColumn("進出場價格", format="%.2f", step=0.01),
+            "買賣方向": st.column_config.SelectboxColumn("買賣方向", options=JOURNAL_ACTIONS, required=True),
             "進出手法": st.column_config.SelectboxColumn("進出手法 (清單選擇，上方可新增自訂選項)", options=method_options),
             "買賣張數": st.column_config.NumberColumn("買賣張數", format="%d", min_value=0, step=1),
             "Note": st.column_config.TextColumn("Note"),
@@ -300,60 +506,194 @@ def journal_editor_dialog():
 
     col_save, col_cancel = st.columns(2)
     with col_save:
-        if st.button("💾 儲存並關閉", use_container_width=True, type="primary", key="journal_editor_save_btn"):
-            save_df = edited_df.copy()
-            save_df["交易日期"] = pd.to_datetime(save_df["交易日期"], errors="coerce").dt.strftime("%Y-%m-%d")
-            save_target_path = st.session_state.get("journal_path", DEFAULT_JOURNAL_PATH)
-            try:
-                save_journal_log(save_target_path, save_df)
-                st.session_state.journal_log_df = load_journal_log(save_target_path)
-
-                # 只有存的是預設路徑 (對應 GitHub repo 根目錄的 Trading Journal.xlsx) 時，
-                # 才需要同步回 GitHub；若目前編輯的是側邊欄上傳的自訂檔案，那份本來就不是
-                # repo 檔案，不會推送 (見上方 journal_github_config 區塊的說明)。
-                if save_target_path == DEFAULT_JOURNAL_PATH:
-                    with open(save_target_path, "rb") as f:
-                        journal_bytes = f.read()
-                    commit_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-                    synced = upload_journal_to_github(journal_bytes, f"Update Trading Journal.xlsx {commit_time}")
-                    if synced:
-                        st.success("已儲存交易紀錄，並同步回 GitHub repo！")
-                        st.rerun()
-                    else:
-                        # 故意不在這裡呼叫 st.rerun()：如果馬上 rerun，這則警告訊息會在
-                        # 使用者還沒看清楚之前就被清掉，變成「同步失敗了但完全沒人發現」。
-                        # 保留對話框開著、警告留在畫面上，使用者可以確認 secrets 設定後
-                        # 再按一次「儲存並關閉」重試，或自行按「取消」關閉。
-                        st.warning(
-                            "⚠️ 已儲存到本機，但同步回 GitHub 失敗（可能是 GITHUB_TOKEN 未設定、權限不足，"
-                            "或網路問題）。這次的編輯目前只存在本機，app 之後若重新部署/重啟，可能會被 "
-                            "GitHub 上的舊版覆蓋而遺失，請確認 Streamlit 部署的 secrets 裡有設定 "
-                            "GITHUB_TOKEN 後再試一次。"
-                        )
-                else:
-                    st.success("已儲存交易紀錄！（目前編輯的是側邊欄上傳的自訂檔案，不會同步回 GitHub repo）")
-                    st.rerun()
-            except PermissionError:
-                st.error(f"儲存失敗：檔案可能正被 Excel 或其他程式開啟中，請先關閉「{save_target_path}」後再試一次。")
-            except Exception as e:
-                st.error(f"儲存失敗: {e}")
-                # 儲存失敗時，提供下載備份，避免編輯內容遺失
-                try:
-                    import io
-                    buf = io.BytesIO()
-                    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                        save_df.to_excel(writer, sheet_name=JOURNAL_LOG_SHEET, index=False)
-                    st.download_button(
-                        "⬇️ 下載目前編輯內容 (寫入失敗時的備份)",
-                        data=buf.getvalue(),
-                        file_name="Trading Journal (備份).xlsx",
-                        key="journal_save_fallback_download",
-                    )
-                except Exception:
-                    pass
+        save_clicked = st.button("💾 儲存並關閉", use_container_width=True, type="primary", key="journal_editor_save_btn")
     with col_cancel:
         if st.button("取消", use_container_width=True, key="journal_editor_cancel_btn"):
+            st.session_state.journal_save_conflict = False
             st.rerun()
+
+    # 「強制覆蓋儲存」只在偵測到衝突之後才出現，平常存檔走一般的「儲存並關閉」即可，
+    # 避免這顆有風險的按鈕平常礙眼、甚至被誤按。
+    force_save_clicked = False
+    if st.session_state.get("journal_save_conflict"):
+        force_save_clicked = st.button(
+            "⚠️ 強制覆蓋儲存（略過衝突檢查，用目前畫面內容覆蓋 GitHub 上的版本）",
+            use_container_width=True, key="journal_editor_force_save_btn",
+        )
+
+    if save_clicked or force_save_clicked:
+        save_df = edited_df.copy()
+        save_df["交易日期"] = pd.to_datetime(save_df["交易日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+        save_target_path = st.session_state.get("journal_path", DEFAULT_JOURNAL_PATH)
+        try:
+            save_journal_log(save_target_path, save_df)
+            st.session_state.journal_log_df = load_journal_log(save_target_path)
+
+            # 只有存的是預設路徑 (對應 GitHub repo 根目錄的 Trading Journal.xlsx) 時，
+            # 才需要同步回 GitHub；若目前編輯的是側邊欄上傳的自訂檔案，那份本來就不是
+            # repo 檔案，不會推送 (見上方 journal_github_config 區塊的說明)。
+            if save_target_path == DEFAULT_JOURNAL_PATH:
+                with open(save_target_path, "rb") as f:
+                    journal_bytes = f.read()
+                commit_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+                result = upload_journal_to_github(
+                    journal_bytes, f"Update Trading Journal.xlsx {commit_time}",
+                    expected_sha=st.session_state.get("journal_github_sha"),
+                    force=force_save_clicked,
+                )
+                if result["success"]:
+                    st.session_state.journal_github_sha = result["sha"]
+                    st.session_state.journal_save_conflict = False
+                    st.success("已儲存交易紀錄，並同步回 GitHub repo！")
+                    st.rerun()
+                elif result["conflict"]:
+                    # 記住目前 GitHub 上最新的 sha，讓使用者接下來不管是「清除快取」還是
+                    # 「強制覆蓋儲存」，比對的都是最新狀態。立刻 rerun 一次，讓上方持續顯示的
+                    # 警告區塊、以及下方新出現的「強制覆蓋儲存」按鈕馬上呈現在畫面上
+                    # （警告本身是依 session_state 常駐顯示的，不會因為 rerun 就被清掉）。
+                    st.session_state.journal_github_sha = result["sha"]
+                    st.session_state.journal_save_conflict = True
+                    st.rerun()
+                else:
+                    # 故意不在這裡呼叫 st.rerun()：如果馬上 rerun，這則警告訊息會在
+                    # 使用者還沒看清楚之前就被清掉，變成「同步失敗了但完全沒人發現」。
+                    # 保留對話框開著、警告留在畫面上，使用者可以確認 secrets 設定後
+                    # 再按一次「儲存並關閉」重試，或自行按「取消」關閉。
+                    st.session_state.journal_save_conflict = False
+                    st.warning(
+                        "⚠️ 已儲存到本機，但同步回 GitHub 失敗（可能是 GITHUB_TOKEN 未設定、權限不足，"
+                        "或網路問題）。這次的編輯目前只存在本機，app 之後若重新部署/重啟，可能會被 "
+                        "GitHub 上的舊版覆蓋而遺失，請確認 Streamlit 部署的 secrets 裡有設定 "
+                        "GITHUB_TOKEN 後再試一次。"
+                    )
+            else:
+                st.session_state.journal_save_conflict = False
+                st.success("已儲存交易紀錄！（目前編輯的是側邊欄上傳的自訂檔案，不會同步回 GitHub repo）")
+                st.rerun()
+        except PermissionError:
+            st.error(f"儲存失敗：檔案可能正被 Excel 或其他程式開啟中，請先關閉「{save_target_path}」後再試一次。")
+        except Exception as e:
+            st.error(f"儲存失敗: {e}")
+            # 儲存失敗時，提供下載備份，避免編輯內容遺失
+            try:
+                import io
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                    save_df.to_excel(writer, sheet_name=JOURNAL_LOG_SHEET, index=False)
+                st.download_button(
+                    "⬇️ 下載目前編輯內容 (寫入失敗時的備份)",
+                    data=buf.getvalue(),
+                    file_name="Trading Journal (備份).xlsx",
+                    key="journal_save_fallback_download",
+                )
+            except Exception:
+                pass
+
+
+@st.dialog("📊 交易紀錄績效總表", width="large")
+def journal_summary_dialog():
+    """彙總「交易紀錄編輯器」裡所有股票的交易紀錄，套用跟單股頁面同一套張數感知 FIFO 配對
+    (match_journal_trades_fifo)，一次看到整體績效，不用切到 Stock simulator 逐檔股票查看。"""
+    journal_df_all = st.session_state.get("journal_log_df", pd.DataFrame(columns=JOURNAL_COLUMNS))
+    if journal_df_all.empty:
+        st.info("目前交易紀錄是空的，請先在「📝 開啟交易紀錄編輯器」新增紀錄。")
+        return
+
+    all_trades = []
+    all_warnings = []
+    for stock_code_i, group in journal_df_all.groupby("股票代碼"):
+        latest_price = latest_close_price_for_code(conn, stock_code_i)
+        stock_trades, stock_warnings = match_journal_trades_fifo(group, latest_price)
+        name_series = group["股票名稱"].dropna()
+        name_i = name_series.iloc[0] if not name_series.empty else ""
+        for t in stock_trades:
+            all_trades.append({"股票代碼": stock_code_i, "股票名稱": name_i, **t})
+        for w in stock_warnings:
+            all_warnings.append(f"{stock_code_i} {name_i}：{w}")
+
+    if all_warnings:
+        with st.expander(f"⚠️ 有 {len(all_warnings)} 筆配對異常，點此查看", expanded=False):
+            for w in all_warnings:
+                st.warning(w)
+
+    if not all_trades:
+        st.info("目前交易紀錄中沒有可配對的買入紀錄。")
+        return
+
+    df_all = pd.DataFrame(all_trades)
+    df_all = df_all[["股票代碼", "股票名稱", "買入日期", "買入手法", "買入張數", "買入價",
+                      "賣出日期", "賣出手法", "賣出張數", "賣出價", "狀態", "報酬率(%)"]]
+
+    n_closed = int((df_all["狀態"] == "已平倉").sum())
+    n_open = int((df_all["狀態"] == "未平倉").sum())
+    has_pnl = df_all["報酬率(%)"].notna()
+    avg_all = df_all.loc[has_pnl, "報酬率(%)"].mean()
+    win_rate_all = (df_all.loc[has_pnl, "報酬率(%)"] > 0).mean() * 100 if has_pnl.any() else None
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("總筆數", f"{len(df_all)} 筆")
+    m2.metric("已平倉 / 未平倉", f"{n_closed} / {n_open}")
+    m3.metric("平均報酬率 (含未平倉)", f"{avg_all:.2f} %" if pd.notna(avg_all) else "-")
+    m4.metric("勝率 (含未平倉)", f"{win_rate_all:.1f} %" if win_rate_all is not None else "-")
+
+    # ============ 全部交易明細（可篩選股票代碼 / 狀態 / 買入日期區間）============
+    st.markdown("**全部交易明細**")
+    buy_dates_all = pd.to_datetime(df_all["買入日期"], errors="coerce")
+    min_buy_date = buy_dates_all.min().date() if buy_dates_all.notna().any() else datetime.now(timezone(timedelta(hours=8))).date()
+    today_date = datetime.now(timezone(timedelta(hours=8))).date()
+
+    fcol1, fcol2, fcol3 = st.columns([1, 1, 1.4])
+    filter_codes = fcol1.multiselect(
+        "篩選股票代碼 (預設全部)", options=sorted(df_all["股票代碼"].unique().tolist()),
+        key="journal_summary_filter_codes",
+    )
+    filter_status = fcol2.multiselect(
+        "篩選狀態", options=["已平倉", "未平倉"], default=["已平倉", "未平倉"],
+        key="journal_summary_filter_status",
+    )
+    # 篩選依「買入日期」區間，預設從最早一筆買入紀錄到今天，涵蓋全部紀錄；
+    # 結束日期預設為今日，方便直接把區間往前拉就能看「最近幾天」的紀錄。
+    date_range = fcol3.date_input(
+        "篩選買入日期區間",
+        value=(min_buy_date, today_date),
+        key="journal_summary_filter_date_range",
+    )
+
+    df_show = df_all.copy()
+    if filter_codes:
+        df_show = df_show[df_show["股票代碼"].isin(filter_codes)]
+    if filter_status:
+        df_show = df_show[df_show["狀態"].isin(filter_status)]
+    # date_input 給範圍值時，使用者只點選了區間其中一端 (還沒點第二端) 的當下會回傳
+    # 長度為1的 tuple，這裡先不套用日期篩選，避免中途出現「暫時性」的錯誤篩選結果，
+    # 等使用者把兩端都選好 (長度為2) 才實際套用。
+    if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+        start_d, end_d = date_range
+        show_buy_dates = pd.to_datetime(df_show["買入日期"], errors="coerce")
+        df_show = df_show[(show_buy_dates.dt.date >= start_d) & (show_buy_dates.dt.date <= end_d)]
+
+    st.dataframe(df_show.sort_values("買入日期", ascending=False), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    with st.expander("📈 依「進出手法」分類的績效（只計入已能算出報酬率的筆數）", expanded=False):
+        df_scored = df_all.loc[has_pnl]
+        if df_scored.empty:
+            st.caption("目前沒有可計算報酬率的紀錄。")
+        else:
+            method_stats = df_scored.groupby("買入手法").agg(
+                筆數=("報酬率(%)", "count"),
+                平均報酬率=("報酬率(%)", "mean"),
+            )
+            method_stats["勝率"] = df_scored.groupby("買入手法")["報酬率(%)"].apply(lambda s: (s > 0).mean() * 100)
+            method_stats = method_stats.reset_index().sort_values("平均報酬率", ascending=False)
+            method_stats["平均報酬率"] = method_stats["平均報酬率"].round(2)
+            method_stats["勝率"] = method_stats["勝率"].round(1)
+            st.dataframe(method_stats, use_container_width=True, hide_index=True)
+
+    if st.button("關閉", use_container_width=True, key="journal_summary_close_btn"):
+        st.rerun()
+
+
 MARK_COLORS = ["#1f4fd6", "#c0392b", "#8e44ad", "#16a085", "#d68910"]
 REVERSE_3K_SIGNAL_KEY = "reverse_3k_reversal"
 REVERSE_3K_MIN_PROFIT_PCT = 10.0
@@ -510,11 +850,11 @@ def save_to_database(db_path: str, df: pd.DataFrame):
     with sqlite3.connect(db_path, timeout=30.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         db_utils.ensure_indexes(conn)  # 確保 (SecurityCode, Date) 索引存在，下面的刪除/查詢才吃得到索引
-        # 2026-08-22 修正：journal_mode=WAL 是記錄在 .db 檔案本身、跨連線持續生效的設定，
+        # 2026-08-17 修正：journal_mode=WAL 是記錄在 .db 檔案本身、跨連線持續生效的設定，
         # 這個檔案之後會被提交進 git repo，但 WAL 模式需要的 -wal/-shm side-car 檔案不會
         # 一起被提交，導致 Streamlit Cloud 之後重新打開這個檔案時可能整個讀取失敗
-        # （這正是「database disk image is malformed」的根因）。寫入完成後主動切回 DELETE
-        # 模式，避免把 WAL 模式留在被提交的 db 檔案裡；寫入當下仍保留 WAL 以避免鎖定問題。
+        # （這次「pandas.errors.DatabaseError」的根因）。寫入完成後主動切回 DELETE 模式，
+        # 避免把 WAL 模式留在被提交的 db 檔案裡；寫入當下仍保留 WAL 以避免鎖定問題。
 
         # 效能備註 (2026-08-12)：原本用 executemany 對「每一列」各發一條
         # DELETE ... WHERE Date=? AND SecurityCode=?，全市場更新時等於逐檔
@@ -552,6 +892,8 @@ if "journal_log_df" not in st.session_state:
     st.session_state.journal_log_df = load_journal_log(DEFAULT_JOURNAL_PATH)
 if "journal_path" not in st.session_state:
     st.session_state.journal_path = DEFAULT_JOURNAL_PATH
+st.session_state.setdefault("journal_github_sha", None)
+st.session_state.setdefault("journal_save_conflict", False)
 if "run_results" not in st.session_state: st.session_state.run_results = None
 
 # --------------------------------------------------------------------------
@@ -795,32 +1137,8 @@ if st.session_state.get("journal_path") != journal_path:
 def _get_conn(path: str, mtime: float):
     return db_utils.get_connection(path)
 
-# 2026-08-22 新增：database disk image is malformed 容錯處理。
-# 這個錯誤通常發生在 Streamlit Cloud 容器裡——twse_ohlcv.db 被 git pull 更新到新版本，
-# 但同資料夾殘留的舊版 -wal/-shm 暫存檔沒有一起被換掉，導致 SQLite 打開時發現主檔案
-# 跟暫存檔對不上而回報「損毀」。db_utils.get_connection() 已經會自動偵測並清除這類
-# 過期的暫存檔重試一次；這裡是最後一道防線——如果自動修復仍然失敗，給使用者清楚的
-# 中文說明與重試按鈕，而不是讓整頁噴出原始 traceback。
-try:
-    conn = _get_conn(db_path, os.path.getmtime(db_path))
-    stock_list_df = db_utils.get_stock_list(conn)
-except Exception as e:
-    err_msg = str(e).lower()
-    if "malformed" in err_msg or "disk image" in err_msg:
-        st.error(
-            "❌ 資料庫檔案讀取失敗：database disk image is malformed\n\n"
-            "這通常代表 Streamlit Cloud 容器裡的 twse_ohlcv.db 跟殘留的暫存檔"
-            "（-wal / -shm）對不上，已嘗試自動清除暫存檔並重試一次仍然失敗。\n\n"
-            "請先點下方「清除快取並重試」；若還是失敗，代表容器內的檔案本身已損毀，"
-            "請到 Streamlit Cloud 的 Manage app 執行 Reboot app，讓它重新從 GitHub "
-            "clone 一份乾淨的 twse_ohlcv.db。"
-        )
-        if st.button("清除快取並重試"):
-            _get_conn.clear()
-            st.rerun()
-        st.stop()
-    else:
-        raise
+conn = _get_conn(db_path, os.path.getmtime(db_path))
+stock_list_df = db_utils.get_stock_list(conn)
 stock_options = [f"{r.SecurityCode} {r.SecurityName}" for r in stock_list_df.itertuples()]
 
 # 判斷目前選擇的股票 (提供給 yfinance 更新時參考)
@@ -849,7 +1167,7 @@ if current_code and not stock_list_df.empty:
 # Sidebar 後半部: 更新 DB & 訊號模組 & 日期
 # --------------------------------------------------------------------------
 with st.sidebar:
-    with st.expander("交易紀錄編輯", expanded=False):
+    with st.expander("交易紀錄", expanded=False):
         if st.button("📝 開啟交易紀錄編輯器", use_container_width=True, key="open_journal_editor_btn"):
             # 只有目前讀取的是預設路徑 (對應 GitHub repo 的 Trading Journal.xlsx) 時，
             # 才嘗試先拉 GitHub 最新版蓋過本機那份，確保編輯器一開就是最新內容，
@@ -858,17 +1176,22 @@ with st.sidebar:
             active_journal_path = st.session_state.get("journal_path", DEFAULT_JOURNAL_PATH)
             if active_journal_path == DEFAULT_JOURNAL_PATH:
                 with st.spinner("正在從 GitHub 抓取最新的交易紀錄..."):
-                    github_bytes = fetch_journal_bytes_from_github()
-                if github_bytes:
+                    meta = fetch_journal_meta_from_github()
+                if meta:
                     try:
                         with open(DEFAULT_JOURNAL_PATH, "wb") as f:
-                            f.write(github_bytes)
+                            f.write(meta["bytes"])
                         st.session_state.journal_log_df = load_journal_log(DEFAULT_JOURNAL_PATH)
+                        st.session_state.journal_github_sha = meta["sha"]
+                        st.session_state.journal_save_conflict = False
                     except Exception:
                         pass  # 抓到了但寫入本機失敗，靜默退回使用本機現有版本
-                # 抓不到 (github_bytes 為 None，例如 repo 裡還沒有這個檔案、或網路問題)
+                # 抓不到 (meta 為 None，例如 repo 裡還沒有這個檔案、或網路問題)
                 # 就靜默退回目前本機已載入的版本，使用者仍可正常編輯，不會比原本行為更差。
             journal_editor_dialog()
+
+        if st.button("📊 開啟交易紀錄績效總表", use_container_width=True, key="open_journal_summary_btn"):
+            journal_summary_dialog()
 
     st.subheader("🔄 更新資料庫")
     update_source = st.radio(
@@ -1705,7 +2028,7 @@ with chart_placeholder:
                 method = jr["進出手法"] if pd.notna(jr["進出手法"]) else ""
                 shares = jr["買賣張數"] if pd.notna(jr["買賣張數"]) else None
                 shares_text = f"{shares:g} 張" if shares is not None else "未填"
-                action = classify_journal_action(method)
+                action = resolve_journal_action(jr)
                 is_sell = action == "賣出"
                 color = "#1565c0" if not is_sell else "#00acc1"  # 買入: 深藍 / 賣出: 藍綠(同屬藍色系但可區分方向)
                 fig.add_trace(go.Scatter(
@@ -1865,64 +2188,15 @@ if st.session_state.run_results is not None:
     elif not enable_backtest or not trades:
         st.info("請先啟用模擬回測功能並產生已平倉交易，才能與交易紀錄比對。")
     else:
-        # 交易紀錄的實際買賣配對：假設同一檔股票的紀錄依日期排序後，買入/賣出交替出現 (FIFO 配對)，
-        # 依「進出手法」判斷買賣方向：優先比對是否為 SELL_LABELS 清單內的賣出型訊號，其餘文字才用是否含「賣」字判斷。
-        # 若你的紀錄慣例不同，這裡的配對邏輯可能需要調整。
-        # 尚未有對應賣出紀錄的買入，會以「最新收盤價」計算目前報酬率，並標註為「未平倉」一併納入比對。
-        journal_for_stock["交易日期_dt"] = pd.to_datetime(journal_for_stock["交易日期"])
-        journal_for_stock = journal_for_stock.sort_values("交易日期_dt")
-        journal_for_stock["動作"] = journal_for_stock["進出手法"].apply(classify_journal_action)
-
+        # 交易紀錄的實際買賣配對：改用共用的 match_journal_trades_fifo()（張數感知的 FIFO
+        # 配對，2026-08-28），依「買賣方向」欄位(缺漏時退回用「進出手法」文字判斷)決定買/賣，
+        # 每筆買入視為獨立持倉批次、依張數精確扣抵，不再是「一買配一賣」的簡化配對，
+        # 分批買、分批賣也能正確算出已平倉/未平倉的張數與報酬率。
+        # 尚未賣出的批次，會以「最新收盤價」計算目前報酬率，並標註為「未平倉」一併納入比對。
         latest_price = float(display_df.iloc[-1]["Close"]) if not display_df.empty else None
-
-        def _journal_shares(row):
-            v = row.get("買賣張數")
-            try:
-                v = float(v)
-                if v > 0:
-                    return v
-            except Exception:
-                pass
-            return 1.0  # 未填寫張數時，比對預設以 1 張計算
-
-        journal_trades = []
-        pending_buy = None
-        for _, jr in journal_for_stock.iterrows():
-            if jr["動作"] == "買入":
-                if pending_buy is not None and latest_price is not None:
-                    # 前一筆買入尚未有對應賣出紀錄，視為未平倉先納入比對
-                    buy_price = float(pending_buy["進出場價格"])
-                    pnl_pct = (latest_price - buy_price) / buy_price * 100 if buy_price else 0
-                    journal_trades.append({
-                        "買入日期": pending_buy["交易日期"], "買入手法": pending_buy["進出手法"],
-                        "買入張數": _journal_shares(pending_buy), "買入價": buy_price,
-                        "賣出日期": "-", "賣出手法": "-", "賣出張數": None, "賣出價": None,
-                        "狀態": "未平倉", "報酬率(%)": round(pnl_pct, 2),
-                    })
-                pending_buy = jr
-            elif jr["動作"] == "賣出" and pending_buy is not None:
-                buy_price = float(pending_buy["進出場價格"])
-                sell_price = float(jr["進出場價格"])
-                pnl_pct = (sell_price - buy_price) / buy_price * 100 if buy_price else 0
-                journal_trades.append({
-                    "買入日期": pending_buy["交易日期"], "買入手法": pending_buy["進出手法"],
-                    "買入張數": _journal_shares(pending_buy), "買入價": buy_price,
-                    "賣出日期": jr["交易日期"], "賣出手法": jr["進出手法"],
-                    "賣出張數": _journal_shares(jr), "賣出價": sell_price,
-                    "狀態": "已平倉", "報酬率(%)": round(pnl_pct, 2),
-                })
-                pending_buy = None
-
-        # 迴圈跑完後，若還有尚未配對到賣出的買入(通常是最後一筆)，同樣視為未平倉納入
-        if pending_buy is not None and latest_price is not None:
-            buy_price = float(pending_buy["進出場價格"])
-            pnl_pct = (latest_price - buy_price) / buy_price * 100 if buy_price else 0
-            journal_trades.append({
-                "買入日期": pending_buy["交易日期"], "買入手法": pending_buy["進出手法"],
-                "買入張數": _journal_shares(pending_buy), "買入價": buy_price,
-                "賣出日期": "-", "賣出手法": "-", "賣出張數": None, "賣出價": None,
-                "狀態": "未平倉", "報酬率(%)": round(pnl_pct, 2),
-            })
+        journal_trades, journal_warnings = match_journal_trades_fifo(journal_for_stock, latest_price)
+        for w in journal_warnings:
+            st.warning(f"⚠️ {w}")
 
         if not journal_trades:
             st.info("交易紀錄中尚無可比對的買入紀錄。")
