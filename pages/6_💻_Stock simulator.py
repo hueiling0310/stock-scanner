@@ -108,8 +108,8 @@ JOURNAL_GITHUB_PATH = "Trading Journal.xlsx"  # 對應 GitHub repo 根目錄下�
 def journal_github_config():
     return {
         "token": st.secrets.get("GITHUB_TOKEN", ""),
-        "owner": st.secrets.get("GITHUB_OWNER", "hueiling0310"),
-        "repo": st.secrets.get("GITHUB_REPO", "stock-scanner"),
+        "owner": st.secrets.get("GITHUB_OWNER", "henglunlin"),
+        "repo": st.secrets.get("GITHUB_REPO", "stock-scanner-FUBAN"),
         "branch": st.secrets.get("GITHUB_BRANCH", "main"),
     }
 
@@ -206,6 +206,124 @@ def upload_journal_to_github(file_bytes: bytes, commit_message: str, expected_sh
         return {"success": False, "sha": current_sha, "conflict": False}
     except Exception:
         return {"success": False, "sha": None, "conflict": False}
+
+
+# --------------------------------------------------------------------------
+# GitHub Actions 觸發工具 (側邊欄「☁️ 觸發雲端更新」按鈕用，2026-09-01 新增)
+# --------------------------------------------------------------------------
+# 側邊欄本來就有一個「執行更新」按鈕，但那是在「這個 Streamlit app 執行的容器內」直接
+# 呼叫 yfinance/TWSE/TPEX API 更新本機的 twse_ohlcv.db——這份 db 只存在容器裡，app
+# 重新部署/重啟就會被 GitHub repo 裡的版本蓋掉，等於本機更新的內容留不住。
+# repo 裡另外有一個「Auto Update TWSE OHLCV DB」GitHub Actions workflow，會真的把更新
+# 結果 commit 回 repo 才是永久保存的方式；這裡新增的按鈕是透過 GitHub REST API 觸發
+# 「這個 workflow」執行 (workflow_dispatch)，並輪詢執行進度顯示進度條，
+# 讓使用者不用跳去 GitHub 網頁手動按「Run workflow」。
+# 沿用跟交易紀錄 GitHub 同步同一組 secrets (GITHUB_TOKEN/OWNER/REPO/BRANCH)，
+# 但 GITHUB_TOKEN 必須額外具備 Actions 的讀寫權限 (classic token 需要 "workflow" scope；
+# fine-grained token 需要 "Actions: Read and write")，否則觸發/查詢會失敗。
+GITHUB_ACTIONS_TWSE_WORKFLOW_NAME = "Auto Update TWSE OHLCV DB"
+
+
+def _github_actions_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def find_github_workflow_id(workflow_name: str):
+    """依照 GitHub Actions 頁面上顯示的 workflow 名稱 (yaml 裡的 name: 欄位) 查出對應的
+    workflow id——觸發 (workflow_dispatch) 與查詢執行紀錄的 API 都要用 id，不能直接用
+    畫面上看到的名稱。查不到 (名稱不符、token 沒權限、網路問題等) 回傳 None。"""
+    cfg = journal_github_config()
+    token, owner, repo = cfg["token"], cfg["owner"], cfg["repo"]
+    if not token or not owner or not repo:
+        return None
+    url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows"
+    try:
+        resp = requests.get(url, headers=_github_actions_headers(token), timeout=15)
+        if resp.status_code == 200:
+            for wf in resp.json().get("workflows", []):
+                if wf.get("name") == workflow_name:
+                    return wf.get("id")
+    except Exception:
+        pass
+    return None
+
+
+def trigger_github_workflow(workflow_id, ref: str) -> bool:
+    """觸發指定 workflow 的 workflow_dispatch 事件 (相當於網頁上按「Run workflow」)。"""
+    cfg = journal_github_config()
+    token, owner, repo = cfg["token"], cfg["owner"], cfg["repo"]
+    if not token or not owner or not repo or not workflow_id:
+        return False
+    url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches"
+    try:
+        resp = requests.post(url, headers=_github_actions_headers(token), json={"ref": ref}, timeout=15)
+        return resp.status_code == 204
+    except Exception:
+        return False
+
+
+def get_latest_workflow_run(workflow_id, branch: str):
+    """取得指定 workflow 在該分支上最新一筆執行紀錄 (run)，用來判斷「剛剛觸發的是哪一筆」
+    (比對觸發前後最新 run 的 id 是否不同) 與後續輪詢狀態。查不到回傳 None。"""
+    cfg = journal_github_config()
+    token, owner, repo = cfg["token"], cfg["owner"], cfg["repo"]
+    if not token or not owner or not repo or not workflow_id:
+        return None
+    url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs"
+    try:
+        resp = requests.get(
+            url, headers=_github_actions_headers(token),
+            params={"branch": branch, "per_page": 1}, timeout=15,
+        )
+        if resp.status_code == 200:
+            runs = resp.json().get("workflow_runs", [])
+            return runs[0] if runs else None
+    except Exception:
+        pass
+    return None
+
+
+def get_workflow_run_by_id(run_id):
+    """取得單一 run 目前的完整狀態 (status: queued/in_progress/completed，
+    conclusion: success/failure/... 只有 completed 時才有值)。"""
+    cfg = journal_github_config()
+    token, owner, repo = cfg["token"], cfg["owner"], cfg["repo"]
+    url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}"
+    try:
+        resp = requests.get(url, headers=_github_actions_headers(token), timeout=15)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+
+def get_workflow_run_progress_fraction(run_id):
+    """GitHub Actions API 本身沒有直接提供「執行到幾%」的數字，只有 queued/in_progress/
+    completed 這種粗略狀態。這裡改抓這個 run 底下所有 job 的 steps，用「已完成步驟數 /
+    總步驟數」換算出一個 0~1 的粗略進度，比單純顯示狀態文字更有「進度條」的感覺。
+    步驟資訊還沒出現 (run 剛建立、步驟數為 0) 時回傳 None，呼叫端可以退回用固定速度估計。"""
+    cfg = journal_github_config()
+    token, owner, repo = cfg["token"], cfg["owner"], cfg["repo"]
+    url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}/jobs"
+    try:
+        resp = requests.get(url, headers=_github_actions_headers(token), timeout=15)
+        if resp.status_code == 200:
+            jobs = resp.json().get("jobs", [])
+            total_steps, done_steps = 0, 0
+            for job in jobs:
+                steps = job.get("steps") or []
+                total_steps += len(steps)
+                done_steps += sum(1 for s in steps if s.get("status") == "completed")
+            if total_steps > 0:
+                return done_steps / total_steps
+    except Exception:
+        pass
+    return None
 
 
 def _stable_upload_path(uploaded_file, cache_key: str, tmp_prefix: str, tmp_filename: str) -> str:
@@ -1367,6 +1485,92 @@ with st.sidebar:
 
     st.markdown("---")
 
+    # ================= 觸發 GitHub Actions：Auto Update TWSE OHLCV DB =================
+    # 跟上面的「執行更新」不同：上面是在這個 app 的容器內直接呼叫 API 更新本機 db，
+    # 容器重啟/重新部署後會被 repo 裡的舊版蓋掉；這裡是觸發 repo 裡真正會把結果 commit
+    # 回 GitHub 的 workflow，才是「永久保存」的更新方式。
+    st.caption("☁️ 觸發雲端更新：執行 GitHub repo 裡的「Auto Update TWSE OHLCV DB」workflow，完成後會直接 commit 回 repo（跟上面「執行更新」是分開的兩件事）。")
+    if st.button("☁️ 觸發 GitHub Actions：Auto Update TWSE OHLCV DB", use_container_width=True, key="trigger_gha_twse_update_btn"):
+        gha_branch = journal_github_config()["branch"]
+        with st.spinner("正在查詢 workflow 資訊..."):
+            gha_workflow_id = find_github_workflow_id(GITHUB_ACTIONS_TWSE_WORKFLOW_NAME)
+
+        if not gha_workflow_id:
+            st.error(
+                f"找不到名為「{GITHUB_ACTIONS_TWSE_WORKFLOW_NAME}」的 GitHub Actions workflow，"
+                "請確認 GITHUB_TOKEN 是否有 Actions 讀取權限 (classic token 需要 workflow scope；"
+                "fine-grained token 需要 Actions: Read)，或 workflow 名稱是否有變更。"
+            )
+        else:
+            before_run = get_latest_workflow_run(gha_workflow_id, gha_branch)
+            before_run_id = before_run["id"] if before_run else None
+
+            triggered = trigger_github_workflow(gha_workflow_id, gha_branch)
+            if not triggered:
+                st.error(
+                    "觸發失敗：請確認 GITHUB_TOKEN 是否有 Actions 的寫入權限 "
+                    "(classic token 需要 workflow scope；fine-grained token 需要 Actions: Read and write)。"
+                )
+            else:
+                gha_progress_bar = st.progress(0.0)
+                gha_status_text = st.empty()
+                gha_status_text.info("已觸發執行，正在等待 GitHub 建立新的執行紀錄...")
+
+                # 剛觸發完，GitHub 那邊通常要 1~2 秒才會出現對應的新 run，
+                # 用短輪詢等待「最新 run 的 id」跟觸發前不一樣，藉此鎖定這次觸發的 run。
+                new_run = None
+                for _ in range(15):
+                    time.sleep(2)
+                    candidate = get_latest_workflow_run(gha_workflow_id, gha_branch)
+                    if candidate and candidate.get("id") != before_run_id:
+                        new_run = candidate
+                        break
+
+                if new_run is None:
+                    gha_status_text.warning(
+                        "已觸發，但暫時查不到對應的新執行紀錄，請直接到 GitHub 的 Actions 頁面確認結果。"
+                    )
+                else:
+                    run_id = new_run["id"]
+                    run_url = new_run.get("html_url", "")
+                    # 最多輪詢 90 次、每次間隔 2 秒 (約 3 分鐘)，避免 workflow 卡住時 app 無限等待；
+                    # 依畫面觀察這個 workflow 平常約 1~2 分鐘完成，3 分鐘已留有餘裕。
+                    max_polls = 90
+                    finished = False
+                    for poll_i in range(max_polls):
+                        run_detail = get_workflow_run_by_id(run_id)
+                        if run_detail is None:
+                            gha_status_text.warning("查詢執行狀態時發生問題，稍後會自動重試...")
+                            time.sleep(2)
+                            continue
+
+                        status = run_detail.get("status")  # queued / in_progress / completed
+                        conclusion = run_detail.get("conclusion")
+
+                        if status == "completed":
+                            gha_progress_bar.progress(1.0)
+                            if conclusion == "success":
+                                gha_status_text.success(f"✅ 執行完成！已將最新資料 commit 回 GitHub repo。[查看執行紀錄]({run_url})")
+                            else:
+                                gha_status_text.error(f"❌ 執行結束，結果為「{conclusion}」，請查看紀錄排查問題。[查看執行紀錄]({run_url})")
+                            finished = True
+                            break
+
+                        # GitHub API 沒有直接給百分比，改用「已完成步驟數/總步驟數」概算進度；
+                        # 步驟資訊還沒出現(通常是 queued 剛開始的幾秒)時，退回用「輪詢次數」概算一個
+                        # 緩慢往前走的進度(最高只到 95%，避免看起來像卡死或提早顯示 100%)。
+                        progress_frac = get_workflow_run_progress_fraction(run_id)
+                        if progress_frac is None:
+                            progress_frac = min(0.05 + poll_i * 0.01, 0.95)
+                        gha_progress_bar.progress(progress_frac)
+                        gha_status_text.info(f"目前狀態: {status}（第 {poll_i + 1} 次查詢，[查看執行紀錄]({run_url})）")
+                        time.sleep(2)
+
+                    if not finished:
+                        gha_status_text.warning(f"⏱️ 輪詢已逾時，執行可能仍在進行中，請到 GitHub 查看最新狀態：{run_url}")
+
+    st.markdown("---")
+
     with st.expander("讀取 signal module", expanded=False):
         signal_files = st.file_uploader("讀取signal module", type=["py"], accept_multiple_files=True, label_visibility="collapsed", key="signal_uploader")
         if signal_files:
@@ -1406,8 +1610,8 @@ with st.sidebar:
 #     掃描資料日期 → 訊號類型 (多選) → 股票代碼/名稱 (單選)　三者階層連動篩選，
 #     ✅ 查看K線圖 (自動帶入下方 Main 控制列並觸發 RUN)、🔄 重新整理 (清快取重抓 GitHub)。
 #   圖表要畫到哪一天，統一交給側邊欄「日期設定」的「結束日期」控制 (不在這裡重複)。
-GITHUB_TRACKING_OWNER = st.secrets.get("GITHUB_OWNER", "hueiling0310")
-GITHUB_TRACKING_REPO = st.secrets.get("GITHUB_REPO", "stock-scanner")
+GITHUB_TRACKING_OWNER = st.secrets.get("GITHUB_OWNER", "henglunlin")
+GITHUB_TRACKING_REPO = st.secrets.get("GITHUB_REPO", "stock-scanner-FUBAN")
 GITHUB_TRACKING_BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
 GITHUB_TRACKING_DIR = st.secrets.get("GITHUB_DATABASE_DIR", "Database")
 
