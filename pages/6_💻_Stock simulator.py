@@ -8,6 +8,7 @@
 """
 import os
 import io
+import re
 import base64
 import tempfile
 import sqlite3
@@ -77,6 +78,11 @@ st.markdown(
 _REPO_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(_REPO_ROOT_DIR, "twse_ohlcv.db")
 DEFAULT_JOURNAL_PATH = os.path.join(_REPO_ROOT_DIR, "Trading Journal.xlsx")
+# 週K/月K 訊號開關 + MA週期控制表 (2026-09-04 新增)：跟 db/journal 同一層目錄，
+# 使用者直接用 Excel 編輯「哪些訊號要開放給日K/週K/月K使用」與「MA10/20/60 在
+# 週K/月K下實際要換算成第幾根K棒的均線」，App 啟動時讀取一次、快取起來，
+# 之後改表想套用新設定，側邊欄按「🔄 重新載入訊號開關表」即可，不用重啟程式。
+DEFAULT_SIGNAL_CONTROL_TABLE_PATH = os.path.join(_REPO_ROOT_DIR, "signal_module_controltable.xlsx")
 JOURNAL_LOG_SHEET = "log"
 JOURNAL_COLUMNS = ["交易日期", "股票代碼", "股票名稱", "進出場價格", "買賣方向", "進出手法", "買賣張數", "Note"]
 JOURNAL_ACTIONS = ["買入", "賣出"]
@@ -812,7 +818,11 @@ def journal_summary_dialog():
         st.rerun()
 
 
-MARK_COLORS = ["#1f4fd6", "#c0392b", "#8e44ad", "#16a085", "#d68910"]
+MARK_COLORS = [
+    "#1f4fd6", "#c0392b", "#8e44ad", "#16a085", "#d68910",
+    "#2471a3", "#a93226", "#6c3483", "#0e6655", "#b9770e",
+    "#1a5276", "#7b241c", "#4a235a", "#0b5345", "#7d6608",
+]
 REVERSE_3K_SIGNAL_KEY = "reverse_3k_reversal"
 REVERSE_3K_MIN_PROFIT_PCT = 10.0
 
@@ -832,6 +842,164 @@ ASC_TREND_TIER_STYLE = {
     "mid": {"color": "#1e8449", "label": "中短期上升趨勢線", "hit_label": "中短期跌破"},
     "long": {"color": "#145a32", "label": "中長期上升趨勢線", "hit_label": "中長期跌破"},
 }
+
+# --------------------------------------------------------------------------
+# 週K/月K 功能 (2026-09-04 新增)
+# --------------------------------------------------------------------------
+# 「週1K」訊號模組 (Weekly_1K.py, key="weekly_1k") 內部本來就會自己把日K resample成
+# 週K再判斷，因此不論目前選的是日K/週K/月K，執行它時一律要餵「原始日K」的資料給它，
+# 不能餵已經被外層resample過的df(否則等於對週K再resample一次，語意錯亂)。
+WEEKLY_1K_SIGNAL_KEY = "weekly_1k"
+
+KLINE_TIMEFRAMES = ["日K", "週K", "月K"]
+# 月K的resample offset別名 2026-09-04 改用 "ME"（月底，Month-End）：pandas 2.2+ 已將舊別名
+# "M" 更名為 "ME"，且新版pandas(3.0+)已直接移除"M"、改用"M"會直接丟例外，
+# 因此固定用新別名 "ME" 才能同時相容pandas 2.2以後的所有版本。
+KLINE_TIMEFRAME_TO_FREQ = {"日K": None, "週K": "W-FRI", "月K": "ME"}
+KLINE_TIMEFRAME_UNIT_LABEL = {"日K": "交易日", "週K": "週", "月K": "月"}
+
+# 控制表xlsx若缺失、或「MA計算」區塊解析失敗時的退回預設值 (對應使用者的規格：
+# 日K=10/20/60、週K=12/26/52、月K=4/6/12，分別對應 MA10/MA20/MA60 這三個欄位名稱)
+DEFAULT_MA_PERIODS = {
+    "日K": (10, 20, 60),
+    "週K": (12, 26, 52),
+    "月K": (4, 6, 12),
+}
+
+_SIGNAL_CONTROL_KEY_RE = re.compile(r"\(([a-zA-Z0-9_]+)\)")
+
+
+def load_signal_control_table(path: str):
+    """
+    讀取「訊號模組控制表」xlsx (使用者自訂格式：A欄是「編號. 標籤(key)【賣】」文字，
+    B/C/D欄是日K/週K/月K是否開放(打V)；下方「MA計算」列開始的三列，B/C/D欄是
+    日K/週K/月K各自的(短期,中期,長期)三個MA根數)。
+
+    回傳 (enabled_map, ma_periods, error_msg)：
+    - enabled_map: {signal_key: {"日K": bool, "週K": bool, "月K": bool}}，
+      單一列若同時列出多個 key(如「Buy01 (buy01)、強勢延伸回測 (buy02)」)，兩個key共用同一組開關。
+    - ma_periods: {"日K": (short,mid,long), "週K": (...), "月K": (...)}，解析失敗的timeframe
+      會個別退回 DEFAULT_MA_PERIODS 對應值。
+    - error_msg: 讀取/解析發生錯誤時的說明文字，成功則為 None。
+      找不到檔案時「不」視為錯誤 (回傳空 enabled_map + 預設 ma_periods + None)，
+      因為使用者可以選擇不建立控制表，此時所有訊號在三個K線週期下都預設開放。
+    """
+    enabled_map = {}
+    ma_periods = dict(DEFAULT_MA_PERIODS)
+    if not path or not os.path.exists(path):
+        return enabled_map, ma_periods, None
+
+    try:
+        raw = pd.read_excel(path, header=None, engine="openpyxl")
+    except Exception as e:
+        return enabled_map, ma_periods, f"讀取 {os.path.basename(path)} 失敗：{e}"
+
+    ma_row_idx = None
+    for idx, row in raw.iterrows():
+        first_cell = row.iloc[0]
+        if not isinstance(first_cell, str) or not first_cell.strip():
+            continue
+        if "MA" in first_cell:
+            ma_row_idx = idx
+            continue
+        keys = _SIGNAL_CONTROL_KEY_RE.findall(first_cell)
+        if not keys:
+            continue
+        day_v = str(row.iloc[1]).strip().upper() == "V"
+        week_v = str(row.iloc[2]).strip().upper() == "V"
+        month_v = str(row.iloc[3]).strip().upper() == "V"
+        for k in keys:
+            enabled_map[k] = {"日K": day_v, "週K": week_v, "月K": month_v}
+
+    if ma_row_idx is not None:
+        ma_vals = {"日K": [], "週K": [], "月K": []}
+        for r in range(ma_row_idx, min(ma_row_idx + 3, len(raw))):
+            row = raw.iloc[r]
+            for col_idx, tf in ((1, "日K"), (2, "週K"), (3, "月K")):
+                v = row.iloc[col_idx]
+                if pd.notna(v):
+                    try:
+                        ma_vals[tf].append(int(v))
+                    except (TypeError, ValueError):
+                        pass
+        for tf in ("日K", "週K", "月K"):
+            if len(ma_vals[tf]) == 3:
+                ma_periods[tf] = tuple(ma_vals[tf])
+
+    return enabled_map, ma_periods, None
+
+
+def is_signal_enabled_for_timeframe(signal_key: str, timeframe: str, enabled_map: dict) -> bool:
+    """訊號沒被列在控制表裡(含控制表本身不存在)時，預設三個K線週期都開放。"""
+    entry = enabled_map.get(signal_key)
+    if entry is None:
+        return True
+    return bool(entry.get(timeframe, True))
+
+
+def resample_ohlcv(daily_df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """
+    把日K OHLCV(index為YYYY-MM-DD字串)依日曆週(W-FRI)/月(M)聚合成週K/月K。
+    Open=首筆、High=最高、Low=最低、Close=末筆、Volume=加總；每根K棒的標籤(index)
+    採用「該週期內實際最後一個交易日」的日期字串 (而不是pandas預設的週日/月曆底日)，
+    確保標籤永遠是真實存在的交易日，跟其餘程式碼(訊號模組用日期字串索引、圖表X軸
+    是"category"類型只認實際存在的日期)相容。日K(timeframe="日K")原樣傳回，不處理。
+    """
+    freq = KLINE_TIMEFRAME_TO_FREQ.get(timeframe)
+    if not freq or daily_df.empty:
+        return daily_df
+
+    df = daily_df.copy()
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[~df.index.isna()].sort_index()
+
+    grouped = df.resample(freq)
+    out = grouped.agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
+    out = out.dropna(subset=["Open", "High", "Low", "Close"])
+    # 每個桶(bucket)實際最後一個交易日 = 該桶內原始日期的最大值，用它取代 resample 預設的
+    # 週期底日標籤 (例如週日/月底calendar日期，很可能根本不是交易日)。
+    # 注意：這裡刻意只對單一欄位(Close)呼叫 .apply()，而不是對整個多欄DataFrame的
+    # resampler呼叫 —— 新版pandas(3.x)裡，對多欄DataFrame resampler做「回傳純量」的
+    # .apply()，會把同一個值廣播貼到「每一欄」、回傳一個形狀跟原始df一樣的DataFrame，
+    # 而不是預期中「每個桶一個值」的Series，導致後面 out.index = ... 賦值時維度對不上而出錯。
+    last_real_date = grouped["Close"].apply(lambda s: s.index.max() if len(s) else pd.NaT)
+    out.index = last_real_date.reindex(out.index)
+    out = out[~out.index.isna()]
+    out.index = out.index.strftime("%Y-%m-%d")
+    return out
+
+
+def snap_date_to_bar_label(bar_index, raw_date) -> str:
+    """
+    週K/月K模式下，把使用者在日期選擇器挑的「日曆日期」對應到它所屬的那一根K棒——
+    也就是 bar_index(週K/月K的日期字串索引，由 resample_ohlcv 產生，每個標籤都是
+    該根K棒最後一個實際交易日) 裡，第一個 >= raw_date 的日期，因為一根K棒涵蓋
+    「上一根K棒標籤(不含) ~ 這一根K棒標籤(含)」的區間。若 raw_date 比所有K棒標籤都晚
+    (代表落在「尚未收盤」的當前週期)，回傳 None 表示找不到對應K棒。
+    """
+    target = pd.Timestamp(raw_date).normalize()
+    candidates = sorted(pd.to_datetime(list(bar_index)))
+    for d in candidates:
+        if d >= target:
+            return d.strftime("%Y-%m-%d")
+    return None
+
+
+def estimate_buffer_days(timeframe: str, longest_ma_period: int) -> int:
+    """
+    依目前K線週期與該週期最長的MA根數，動態估算「往前需要多拉多少天的日K資料」，
+    才夠讓resample後的週K/月K有足夠根數計算出最長那條均線(如週K的MA52週、月K的MA12月)。
+    日K維持原本固定90天緩衝；週K/月K則依根數換算實際日曆天數，並多留一些安全邊際
+    (週K多留8週、月K多留3個月)，避免掃描期間本身、或假日/停牌造成的根數短缺。
+    """
+    if timeframe == "日K":
+        return 90
+    if timeframe == "週K":
+        return (longest_ma_period + 8) * 7
+    if timeframe == "月K":
+        return (longest_ma_period + 3) * 31
+    return 90
+
 
 # --------------------------------------------------------------------------
 # API 抓取工具函數 (TWSE / TPEX / yfinance)
@@ -1014,11 +1182,27 @@ st.session_state.setdefault("journal_github_sha", None)
 st.session_state.setdefault("journal_save_conflict", False)
 if "run_results" not in st.session_state: st.session_state.run_results = None
 
+if "signal_control_enabled_map" not in st.session_state:
+    _scm, _scma, _scerr = load_signal_control_table(DEFAULT_SIGNAL_CONTROL_TABLE_PATH)
+    st.session_state.signal_control_enabled_map = _scm
+    st.session_state.signal_control_ma_periods = _scma
+    st.session_state.signal_control_load_error = _scerr
+
 # --------------------------------------------------------------------------
 # 取得預設 Buy/Sell 條件陣列
 # --------------------------------------------------------------------------
 signal_keys = list(st.session_state.signal_registry.keys())
 signal_labels = {k: st.session_state.signal_registry[k]["label"] for k in signal_keys}
+
+# 目前選定的K線週期 (側邊欄「K線週期」選單元件本身在下面才會渲染，但session_state的值
+# 在渲染之前就可以先讀到——第一次執行(還沒有這個key)時退回"日K"，跟該元件的預設值一致)
+current_kline_timeframe = st.session_state.get("chart_kline_timeframe", "日K")
+_signal_enabled_map = st.session_state.get("signal_control_enabled_map", {})
+
+
+def is_signal_enabled_now(k: str) -> bool:
+    return is_signal_enabled_for_timeframe(k, current_kline_timeframe, _signal_enabled_map)
+
 
 default_buy_labels = ["3K反轉", "島狀反轉", "KD高腳", "下降趨勢線突破"]
 default_buy_keys = [k for k, lbl in signal_labels.items() if lbl in default_buy_labels]
@@ -1027,10 +1211,15 @@ default_buy_keys = [k for k, lbl in signal_labels.items() if lbl in default_buy_
 default_sell_labels = ["反向島狀", "跌停", "移動停利"]
 default_sell_keys = [k for k, lbl in signal_labels.items() if lbl in default_sell_labels]
 
-# 買入條件選單：僅列出「非賣出型」訊號，避免與賣出訊號混雜在同一份清單中
-buy_option_keys = [k for k in signal_keys if signal_labels[k] not in SELL_LABELS]
-# 賣出條件選單：僅列出「賣出型」訊號 + 可作為出場依據的反轉型態訊號 (如 反向3K反轉)
-sell_option_keys = signal_keys
+# 買入條件選單：僅列出「非賣出型」訊號，且依控制表在「目前K線週期」下是否開放做過濾
+buy_option_keys = [k for k in signal_keys if signal_labels[k] not in SELL_LABELS and is_signal_enabled_now(k)]
+# 賣出條件選單：僅列出「賣出型」訊號 + 可作為出場依據的反轉型態訊號 (如 反向3K反轉)，同樣依控制表過濾
+sell_option_keys = [k for k in signal_keys if is_signal_enabled_now(k)]
+
+# default_buy_keys / default_sell_keys 也要同步過濾，否則若預設訊號剛好在目前K線週期被關閉，
+# st.multiselect(default=...) 裡出現不在 options 裡的值會直接丟例外
+default_buy_keys = [k for k in default_buy_keys if k in buy_option_keys]
+default_sell_keys = [k for k in default_sell_keys if k in sell_option_keys]
 
 
 def is_sell_key(k: str) -> bool:
@@ -1044,8 +1233,34 @@ def sorted_by_category(keys: list) -> list:
 
 # 供「圖表標記訊號勾選」與「賣出條件1」等混合買/賣類型的選單使用（依分類排序，
 # 買入型訊號在前、賣出型訊號在後；下拉選單中間會有一條分隔線區分兩類，見下方CSS/JS）
-signal_keys_categorized = sorted_by_category(signal_keys)
+# 「圖表標記訊號勾選」也依控制表在目前K線週期下的開放狀態過濾，避免勾選到不會被評估的訊號。
+signal_keys_categorized = sorted_by_category([k for k in signal_keys if is_signal_enabled_now(k)])
 sell_option_keys_categorized = sorted_by_category(sell_option_keys)
+
+# --------------------------------------------------------------------------
+# 切換K線週期時，把「已勾選但在新週期下不合格」的訊號自動從選單狀態中移除，並提示使用者
+# (不清掉的話，st.multiselect 的 session_state 值裡若殘留不在 options 內的 key 會直接丟例外)。
+# --------------------------------------------------------------------------
+_kline_cleanup_targets = [
+    ("chart_buy_signals", buy_option_keys),
+    ("chart_sell_signals", sell_option_keys_categorized),
+    ("chart_mark_signal_keys", signal_keys_categorized),
+]
+if st.session_state.get("_prev_kline_timeframe") != current_kline_timeframe:
+    _removed_labels = []
+    for _key, _allowed in _kline_cleanup_targets:
+        _cur_val = st.session_state.get(_key)
+        if isinstance(_cur_val, list):
+            _kept = [v for v in _cur_val if v in _allowed]
+            if len(_kept) != len(_cur_val):
+                _removed_labels.extend(signal_labels.get(v, v) for v in _cur_val if v not in _allowed)
+                st.session_state[_key] = _kept
+    if st.session_state.get("_prev_kline_timeframe") is not None and _removed_labels:
+        st.session_state["_kline_switch_notice"] = (
+            f"已切換為「{current_kline_timeframe}」，以下訊號在此週期下未開放，已自動從勾選中移除："
+            + "、".join(sorted(set(_removed_labels)))
+        )
+    st.session_state["_prev_kline_timeframe"] = current_kline_timeframe
 
 
 # --------------------------------------------------------------------------
@@ -1170,6 +1385,38 @@ components.html(
 with st.sidebar:
     st.header("參數設定")
 
+    st.subheader("K線週期")
+    st.radio(
+        "K線週期",
+        options=KLINE_TIMEFRAMES,
+        index=KLINE_TIMEFRAMES.index(current_kline_timeframe) if current_kline_timeframe in KLINE_TIMEFRAMES else 0,
+        horizontal=True,
+        key="chart_kline_timeframe",
+        label_visibility="collapsed",
+    )
+    st.caption("切換後，K線圖、技術指標(MA/KD/RSI/布林通道)、訊號判斷、模擬回測會整頁一起改用該週期重新計算，請重新按 RUN。")
+
+    if st.session_state.get("_kline_switch_notice"):
+        st.info(st.session_state.pop("_kline_switch_notice"))
+
+    with st.expander("🔧 訊號開關表 / MA週期設定", expanded=False):
+        if st.session_state.get("signal_control_load_error"):
+            st.warning(f"⚠️ {st.session_state.signal_control_load_error}（此時所有訊號預設三個週期皆開放）")
+        elif not st.session_state.get("signal_control_enabled_map"):
+            st.caption(f"目前找不到 {os.path.basename(DEFAULT_SIGNAL_CONTROL_TABLE_PATH)}，所有訊號預設三個週期皆開放。若要自訂各訊號在日K/週K/月K下是否開放、以及MA10/20/60的實際根數，請在跟資料庫同一層目錄放這份控制表。")
+        else:
+            _ma_now = st.session_state.get("signal_control_ma_periods", DEFAULT_MA_PERIODS).get(current_kline_timeframe, DEFAULT_MA_PERIODS[current_kline_timeframe])
+            st.caption(f"目前「{current_kline_timeframe}」的 MA10 / MA20 / MA60 實際根數：{_ma_now[0]} / {_ma_now[1]} / {_ma_now[2]}（欄位名稱不變，僅內部計算根數依控制表設定）")
+        if st.button("🔄 重新載入訊號開關表", use_container_width=True, key="reload_signal_control_table_btn"):
+            _scm, _scma, _scerr = load_signal_control_table(DEFAULT_SIGNAL_CONTROL_TABLE_PATH)
+            st.session_state.signal_control_enabled_map = _scm
+            st.session_state.signal_control_ma_periods = _scma
+            st.session_state.signal_control_load_error = _scerr
+            st.success("已重新載入訊號開關表設定。")
+            st.rerun()
+
+    st.markdown("---")
+
     st.subheader("圖表顯示設定")
     show_ma10 = st.checkbox("顯示 10MA", value=False, key="chart_show_ma10")
     show_ma20 = st.checkbox("顯示 20MA", value=False, key="chart_show_ma20")
@@ -1188,21 +1435,29 @@ with st.sidebar:
 
         buy_signals = []
         buy_shares_dict = {}
+        stop_loss_dict = {}
+        take_profit_dict = {}
         buy_cooldown = 0
         sell_signals = []
         enable_take_profit = False
-        take_profit_pct = 10.0
-        stop_loss_pct = 10.0
 
         if enable_backtest:
             buy_signals = st.multiselect("買入條件 (可複選)", options=buy_option_keys, default=default_buy_keys, format_func=lambda k: signal_labels.get(k, k), key="chart_buy_signals")
             st.caption("此清單僅列出可作為進場依據之訊號，不含賣出型訊號。")
             if buy_signals:
+                # 停損/停利改為依「買入訊號」個別設定 (2026-09-03)：每個買入訊號可以有自己的
+                # 停損%/停利%，取代舊版全域共用一組數字的做法，讓不同訊號可依其特性分別調校。
                 for i, sig in enumerate(buy_signals):
                     lbl = signal_labels.get(sig, sig)
                     buy_shares_dict[sig] = st.number_input(f"➤ 【{lbl}】買入張數", value=1, min_value=1, step=1, key=f"buy_share_{i}_{sig}")
+                    sl_col, tp_col = st.columns(2)
+                    stop_loss_dict[sig] = sl_col.number_input("　停損 (%)", value=10.0, min_value=0.0, step=1.0, key=f"buy_sl_{i}_{sig}")
+                    take_profit_dict[sig] = tp_col.number_input("　停利 (%)", value=10.0, min_value=0.0, step=1.0, key=f"buy_tp_{i}_{sig}")
                 st.write("")
-                buy_cooldown = st.number_input("同訊號再次買入冷卻期 (交易日)", value=0, min_value=0, step=1, key="chart_buy_cooldown")
+                buy_cooldown = st.number_input(
+                    f"同訊號再次買入冷卻期 ({KLINE_TIMEFRAME_UNIT_LABEL[current_kline_timeframe]})",
+                    value=0, min_value=0, step=1, key="chart_buy_cooldown",
+                )
 
                 st.write("")
                 enable_bias60_filter = st.checkbox("啟用買入限制：60MA乖離率過高不買", value=False, key="chart_enable_bias60_filter")
@@ -1214,11 +1469,7 @@ with st.sidebar:
             sell_signals = st.multiselect("賣出條件1 (訊號出場，可複選)", options=sell_option_keys_categorized, default=default_sell_keys, format_func=lambda k: signal_labels.get(k, k), key="chart_sell_signals")
             st.caption("此清單包含賣出型訊號 (綠色標籤)，亦可額外選用反轉型態訊號 (如反向3K反轉) 作為出場依據。")
             enable_take_profit = st.checkbox("啟用賣出條件2（漲幅達標賣出）", value=False, key="chart_enable_take_profit")
-            take_profit_pct = st.number_input("賣出條件2: 停利達標 (%)", value=10.0, step=1.0, disabled=not enable_take_profit, key="chart_take_profit_pct")
-            st.caption("反向3K反轉：每筆持倉須先獲利超過 10%，才會依該訊號賣出。")
-
-            # 停損預設改為 10.0%
-            stop_loss_pct = st.number_input("停損達標 (%) -> 單筆賣出", value=10.0, step=1.0, key="chart_stop_loss_pct")
+            st.caption("停利/停損百分比請於上方各買入訊號下方個別設定。反向3K反轉：每筆持倉須先獲利超過 10%，才會依該訊號賣出。")
 
     st.markdown("---")
 
@@ -1847,183 +2098,309 @@ with col4:
 
 
 # --------------------------------------------------------------------------
+# 回測引擎 (2026-09-03 抽出)：原本整段寫在 RUN 按鈕的 if 區塊內，跟「單次執行」耦合在一起。
+# 抽成獨立函式後，「單次執行(RUN)」與「參數批次測試(parameter sweep)」都呼叫同一份邏輯，
+# 不必維護兩份幾乎相同的回測程式碼。除了原本的 trades / active_positions / max_capital_used /
+# signal_error_log，額外多回傳 equity_curve（逐日「已實現損益累計 + 未平倉部位未實現損益」的
+# 權益序列，供畫出權益曲線與計算最大回撤），以及每筆已平倉交易新增「持有天數」欄位（供平均持有
+# 天數統計使用）。停損/停利改為依「買入訊號」個別傳入 dict（stop_loss_dict / take_profit_dict），
+# 取代舊版全域共用一組數字的做法；找不到對應訊號時退回 10% 預設值。
+# --------------------------------------------------------------------------
+def run_backtest_simulation(
+    display_df, full_df, full_df_close, full_df_bias60, full_df_pos,
+    stock_code, stock_name,
+    buy_signals, buy_shares_dict, buy_cooldown,
+    sell_signals, enable_take_profit,
+    stop_loss_dict, take_profit_dict,
+    enable_bias60_filter=False, max_bias60_buy_pct=20.0,
+    enable_min_score_filter=False, min_entry_score=55.0,
+    default_stop_loss_pct=10.0, default_take_profit_pct=10.0,
+    daily_full_df=None,
+):
+    from signal_module.base import SignalContext
+
+    # 2026-09-04 新增：週K/月K模式下，full_df 已經是resample後的資料，但「週1K」訊號
+    # 模組(WEEKLY_1K_SIGNAL_KEY)內部本來就會自己把「原始日K」再resample一次判斷週線，
+    # 若餵它已經被resample過的df等於resample兩次、語意錯亂，因此它一律要吃原始日K
+    # (daily_full_df)。日K模式下 daily_full_df 就是 full_df 本身，行為不變。
+    _daily_ctx_df = daily_full_df if daily_full_df is not None else full_df
+
+    def _ctx_df_for(sig):
+        return _daily_ctx_df if sig == WEEKLY_1K_SIGNAL_KEY else full_df
+
+    trades = []
+    active_positions = []
+    last_buy_idx = {}
+    max_capital_used = 0
+    signal_error_log = []
+    equity_curve = []  # [{"date": d, "equity": 已實現損益累計 + 未平倉未實現損益}, ...]
+    realized_pnl_cum = 0
+
+    for i, d in enumerate(display_df.index):
+        current_price = full_df_close[d]
+
+        # --- 賣出檢查 ---
+        if len(active_positions) > 0:
+            triggered_sell_signals = []
+            if sell_signals:
+                for sig in sell_signals:
+                    ctx_sell = SignalContext(code=stock_code, name=stock_name, df=_ctx_df_for(sig), scan_date=d)
+                    try:
+                        if st.session_state.signal_registry[sig]["func"](ctx_sell).hit:
+                            triggered_sell_signals.append(sig)
+                    except Exception as e:
+                        signal_error_log.append({
+                            "訊號": signal_labels.get(sig, sig), "日期": d,
+                            "動作": "賣出檢查", "錯誤": str(e),
+                        })
+
+            remaining_positions = []
+
+            for pos in active_positions:
+                profit_pct = (current_price - pos["buy_price"]) / pos["buy_price"] * 100
+                sell_reason = None
+
+                eligible_signal = next((sig for sig in triggered_sell_signals if sig != REVERSE_3K_SIGNAL_KEY or profit_pct > REVERSE_3K_MIN_PROFIT_PCT), None)
+
+                pos_stop_loss = stop_loss_dict.get(pos["signal_key"], default_stop_loss_pct)
+                pos_take_profit = take_profit_dict.get(pos["signal_key"], default_take_profit_pct)
+
+                if profit_pct <= -pos_stop_loss:
+                    sell_reason = f"停損出場 ({profit_pct:.1f}%)"
+                elif enable_take_profit and profit_pct >= pos_take_profit:
+                    sell_reason = f"停利達標 ({profit_pct:.1f}%)"
+                elif eligible_signal is not None:
+                    sell_reason = f"訊號出場 ({signal_labels.get(eligible_signal, eligible_signal)})"
+
+                if sell_reason:
+                    pnl = (current_price - pos["buy_price"]) * pos["shares"] * 1000
+                    holding_days = (pd.to_datetime(d) - pd.to_datetime(pos["buy_date"])).days
+                    realized_pnl_cum += pnl
+                    trades.append({
+                        "買入日期": pos["buy_date"], "買入理由": pos["signal_label"],
+                        "進場評分": pos.get("entry_score"), "評分等級": pos.get("entry_grade"),
+                        "同日觸發訊號": pos.get("entry_signals", ""),
+                        "買入價": pos["buy_price"], "張數": pos["shares"],
+                        "賣出日期": d, "賣出理由": sell_reason, "賣出價": current_price,
+                        "損益(元)": round(pnl), "報酬率(%)": round(profit_pct, 2),
+                        "持有天數": holding_days,
+                    })
+                else:
+                    remaining_positions.append(pos)
+
+            active_positions = remaining_positions
+            # 2026-08-16 修正：原本「當天只要有賣出就直接 continue」，導致同一天
+            # 停損/停利/訊號出場後，即使當天另有買入訊號觸發，也結構性地不可能同日
+            # 再進場。改成賣出檢查結束後照常往下走買入檢查，讓同日再進場成為可能；
+            # 「同訊號再次買入冷卻期」(last_buy_idx/buy_cooldown) 不受影響，仍會正常
+            # 擋下同一個訊號在冷卻期內的重複買入 (含當天賣出、當天又觸發同訊號的情況)。
+
+        # --- 買入檢查 ---
+        if buy_signals:
+            current_bias60 = full_df_bias60.get(d, 0)
+            if enable_bias60_filter and pd.notna(current_bias60) and current_bias60 > max_bias60_buy_pct:
+                pass
+            else:
+                # 先跑過今天所有勾選的買入條件，收集「今天實際觸發的訊號」。
+                # 評分要看的是今天整體訊號共振強度，跟個別訊號是否還在冷卻期無關；
+                # 冷卻期只決定「要不要真的建倉」，放在後面單獨判斷。
+                hit_today = []
+                for sig in buy_signals:
+                    ctx_buy = SignalContext(code=stock_code, name=stock_name, df=_ctx_df_for(sig), scan_date=d)
+                    try:
+                        if st.session_state.signal_registry[sig]["func"](ctx_buy).hit:
+                            hit_today.append(sig)
+                    except Exception as e:
+                        signal_error_log.append({
+                            "訊號": signal_labels.get(sig, sig), "日期": d,
+                            "動作": "買入檢查", "錯誤": str(e),
+                        })
+
+                entry_score, entry_grade, entry_signals_text = None, None, ""
+                if hit_today:
+                    score_data = build_score_input(full_df, d, full_df_pos[d])
+                    score_labels = [signal_labels.get(s, s) for s in hit_today]
+                    score_kinds = {lbl: "buy" for lbl in score_labels}
+                    entry_score = calc_signal_quality_score(score_data, score_labels, score_kinds)
+                    entry_grade = classify_signal_grade(entry_score)
+                    entry_signals_text = "、".join(score_labels)
+
+                for sig in hit_today:
+                    if sig in last_buy_idx and (i - last_buy_idx[sig]) <= buy_cooldown: continue
+                    if enable_min_score_filter and entry_score is not None and entry_score < min_entry_score: continue
+
+                    active_positions.append({
+                        "buy_date": d, "buy_price": current_price, "shares": buy_shares_dict[sig],
+                        "signal_key": sig, "signal_label": signal_labels.get(sig, sig),
+                        "entry_score": entry_score, "entry_grade": entry_grade,
+                        "entry_signals": entry_signals_text,
+                    })
+                    last_buy_idx[sig] = i
+                    current_invested = sum(p["buy_price"] * p["shares"] * 1000 for p in active_positions)
+                    max_capital_used = max(max_capital_used, current_invested)
+
+        # --- 權益曲線 (Equity Curve)：當天已實現損益累計 + 目前所有未平倉部位的未實現損益 ---
+        unrealized_pnl = sum((current_price - p["buy_price"]) * p["shares"] * 1000 for p in active_positions)
+        equity_curve.append({"date": d, "equity": realized_pnl_cum + unrealized_pnl})
+
+    return trades, active_positions, max_capital_used, signal_error_log, equity_curve
+
+
+# --------------------------------------------------------------------------
+# 圖表標記防重疊 (2026-09-03)：K線圖上總共有 4 套各自獨立的文字標記系統
+# (①一般訊號標記 ②趨勢線突破/跌破的觸發標籤 ③模擬回測 B/S 標記 ④交易紀錄菱形標記)，
+# 原本各自只在「自己這套系統內、同一天」做防重疊錯開，彼此之間互不相通，導致行情轉折時
+# (常常正好是多套系統同時觸發的時候) 疊出一團文字。這裡改用一個「全部共用」的堆疊計數器：
+# 用 display_pos(日期在圖表可視範圍內的整數位置) // ANNOTATION_CLUSTER_WINDOW 分組，讓
+# 相鄰1~2個交易日內、不管來自哪一套系統的標記，都算進同一疊，依序往外一層一層疊上去；
+# 且一律固定 ax=0（不再左右歪斜），純粹用 ay 垂直堆疊，畫出來才會是整齊的一排文字，
+# 而不是東一個西一個的散開。買入方向(direction="down")往下疊、賣出方向("up")往上疊。
+# --------------------------------------------------------------------------
+ANNOTATION_CLUSTER_WINDOW = 2
+ANNOTATION_BASE_AY = 26
+ANNOTATION_STEP_AY = 24
+
+
+def _next_annotation_slot(stack_state, display_pos, d, direction, cluster_window=ANNOTATION_CLUSTER_WINDOW):
+    bucket = (display_pos.get(d, 0) // cluster_window, direction)
+    slot = stack_state.get(bucket, 0)
+    stack_state[bucket] = slot + 1
+    return slot
+
+
+def _stacked_ay(stack_state, display_pos, d, direction, base=ANNOTATION_BASE_AY, step=ANNOTATION_STEP_AY):
+    slot = _next_annotation_slot(stack_state, display_pos, d, direction)
+    sign = 1 if direction == "down" else -1
+    return (base + slot * step) * sign
+
+
+# --------------------------------------------------------------------------
 # RUN: 讀取資料 + 執行訊號判斷 + 執行回測
 # --------------------------------------------------------------------------
 if run_clicked:
     try:
         from signal_module.base import SignalContext
 
+        # 2026-09-04：依目前選定的K線週期(日K/週K/月K)，決定要用哪一組 MA10/20/60 根數、
+        # 需要往前多抓多少天的日K緩衝資料 (週K/月K需要比日K多抓，才夠算出52週/12月的均線)。
+        _ma_periods_map = st.session_state.get("signal_control_ma_periods", DEFAULT_MA_PERIODS)
+        ma_periods = _ma_periods_map.get(current_kline_timeframe, DEFAULT_MA_PERIODS[current_kline_timeframe])
+        buffer_days = estimate_buffer_days(current_kline_timeframe, max(ma_periods))
+
         # 資料抓取範圍需同時涵蓋「圖表顯示範圍(scan_start_date~scan_end_date)」與「單日驗證掃描日期(scan_target_date)」，
         # 避免掃描日期落在圖表範圍之外時，被誤判為「掃描日不在資料範圍內」。
         # 注意：fetch_end_str 只用來決定「抓取多少資料」，圖表實際顯示範圍仍以使用者設定的 scan_end_date 為準 (見下方 chart_end_str)。
         effective_start = min(pd.to_datetime(scan_start_date), pd.to_datetime(scan_target_date))
         effective_end = max(pd.to_datetime(scan_end_date), pd.to_datetime(scan_target_date))
-        buffer_start = (effective_start - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
+        buffer_start = (effective_start - pd.Timedelta(days=buffer_days)).strftime("%Y-%m-%d")
         fetch_end_str = effective_end.strftime("%Y-%m-%d")
         scan_start_str = pd.to_datetime(scan_start_date).strftime("%Y-%m-%d")
         chart_end_str = pd.to_datetime(scan_end_date).strftime("%Y-%m-%d")
         scan_target_str = pd.to_datetime(scan_target_date).strftime("%Y-%m-%d")
+        # 保留使用者原始選的日曆日期字串 (未經週K/月K snap)，供下方「結果是否已過期」提示比對用，
+        # 因為 scan_target_str 後續在週K/月K模式下會被改寫成snap後的K棒標籤日期。
+        raw_scan_target_str = scan_target_str
 
         # 若更新後快取被清空，這裡會重新建立連線
         conn = _get_conn(db_path, os.path.getmtime(db_path))
 
-        full_df = db_utils.get_stock_ohlcv(conn, stock_code, buffer_start, fetch_end_str)
+        daily_raw_df = db_utils.get_stock_ohlcv(conn, stock_code, buffer_start, fetch_end_str)
         stock_name = db_utils.get_stock_name(conn, stock_code)
 
-        if full_df.empty:
+        if daily_raw_df.empty:
             st.error("查無此股票在該期間的資料")
-        elif scan_target_str not in full_df.index:
+        elif scan_target_str not in daily_raw_df.index:
             st.error(f"訊號掃描日期 {scan_target_str} 不在資料範圍內 (可能為非交易日，或該股票在此日期尚無資料)")
         else:
-            full_df = indicators.add_indicators(full_df)
-            full_df["VolMA5"] = full_df["Volume"].rolling(5, min_periods=1).mean()
-            if "VolMA10" not in full_df.columns:
-                full_df["VolMA10"] = full_df["Volume"].rolling(10, min_periods=1).mean()
+            # 「週1K」訊號模組永遠吃原始日K資料 (詳見 run_backtest_simulation 說明)，
+            # 這裡固定用日K自己的 MA10/20/60 根數計算指標，不受目前K線週期選擇影響。
+            daily_full_df = indicators.add_indicators(daily_raw_df, ma_periods=DEFAULT_MA_PERIODS["日K"])
+            daily_full_df["VolMA5"] = daily_full_df["Volume"].rolling(5, min_periods=1).mean()
+            if "VolMA10" not in daily_full_df.columns:
+                daily_full_df["VolMA10"] = daily_full_df["Volume"].rolling(10, min_periods=1).mean()
 
-            # 1. 執行單日訊號驗證
-            results = {}
-            for key in selected_signal_keys:
-                entry = st.session_state.signal_registry[key]
-                ctx = SignalContext(code=stock_code, name=stock_name, df=full_df, scan_date=scan_target_str)
-                try:
-                    results[key] = entry["func"](ctx)
-                except Exception as e:
-                    from signal_module.base import SignalResult
-                    results[key] = SignalResult(hit=False, detail=f"執行錯誤: {e}")
+            # 依目前K線週期把原始日K resample成週K/月K (日K模式下 resample_ohlcv 直接原樣回傳)
+            full_df = resample_ohlcv(daily_raw_df, current_kline_timeframe)
 
-            # 圖表顯示範圍維持使用者在「日期設定」設定的 scan_start_date ~ scan_end_date，
-            # 不會因為單日驗證掃描日期(scan_target_date)超出此範圍而被意外撐大
-            display_df = full_df[(full_df.index >= scan_start_str) & (full_df.index <= chart_end_str)]
-        
-            # 2. 執行區間模擬回測邏輯
-            trades = []
-            active_positions = []
-            last_buy_idx = {}
-            max_capital_used = 0
-            # 收集回測迴圈裡「訊號模組執行失敗」的紀錄 (訊號名稱/日期/錯誤訊息)，
-            # 之前是 except: pass 整個吞掉、使用者完全看不到；現在改成不中斷回測，
-            # 但把每一筆失敗都記下來，跑完後在「模擬回測績效」上方集中顯示一段警告。
-            signal_error_log = []
+            # 週K/月K模式下，使用者在日期選擇器挑的是「日曆日期」，要對應到它所屬的那一根
+            # K棒(該K棒最後一個實際交易日的標籤)；日K模式則維持原樣，不需要snap。
+            if current_kline_timeframe == "日K":
+                snapped_scan_target_str = scan_target_str
+            else:
+                snapped_scan_target_str = snap_date_to_bar_label(full_df.index, scan_target_date)
 
-            # 效能最佳化 (2026-08-16)：原本迴圈裡「每一天」都對 full_df 做 .loc[d, col]
-            # 標籤查找 (Close、Bias60)，label-based .loc 在迴圈內重複呼叫的開銷不小；
-            # 這裡改成迴圈開始前先把需要的欄位一次性轉成 {日期: 值} 的 dict、以及
-            # {日期: 在full_df裡的位置} 的 dict，迴圈內全部改用 dict 查找。純粹是查找方式
-            # 改變，不影響任何計算邏輯或回測結果 (不動訊號模組本身的執行方式)。
-            full_df_close = full_df["Close"].to_dict()
-            full_df_bias60 = full_df["Bias60"].to_dict() if "Bias60" in full_df.columns else {}
-            full_df_pos = {date: pos for pos, date in enumerate(full_df.index)}
+            if full_df.empty or snapped_scan_target_str is None or snapped_scan_target_str not in full_df.index:
+                st.error(
+                    f"訊號掃描日期 {scan_target_str} 在「{current_kline_timeframe}」週期下資料不足"
+                    "(可能該週期尚未收盤，或往前資料不夠算出所需均線，請往前調整掃描日期或日期範圍)"
+                )
+            else:
+                scan_target_str = snapped_scan_target_str
+                full_df = indicators.add_indicators(full_df, ma_periods=ma_periods)
+                full_df["VolMA5"] = full_df["Volume"].rolling(5, min_periods=1).mean()
+                if "VolMA10" not in full_df.columns:
+                    full_df["VolMA10"] = full_df["Volume"].rolling(10, min_periods=1).mean()
 
-            if enable_backtest:
-                for i, d in enumerate(display_df.index):
-                    current_price = full_df_close[d]
+                # 1. 執行單日訊號驗證 (「週1K」訊號一律吃 daily_full_df，其餘吃目前週期的 full_df)
+                results = {}
+                for key in selected_signal_keys:
+                    entry = st.session_state.signal_registry[key]
+                    _ctx_df = daily_full_df if key == WEEKLY_1K_SIGNAL_KEY else full_df
+                    ctx = SignalContext(code=stock_code, name=stock_name, df=_ctx_df, scan_date=scan_target_str)
+                    try:
+                        results[key] = entry["func"](ctx)
+                    except Exception as e:
+                        from signal_module.base import SignalResult
+                        results[key] = SignalResult(hit=False, detail=f"執行錯誤: {e}")
 
-                    # --- 賣出檢查 ---
-                    if len(active_positions) > 0:
-                        triggered_sell_signals = []
-                        if sell_signals:
-                            ctx_sell = SignalContext(code=stock_code, name=stock_name, df=full_df, scan_date=d)
-                            for sig in sell_signals:
-                                try:
-                                    if st.session_state.signal_registry[sig]["func"](ctx_sell).hit:
-                                        triggered_sell_signals.append(sig)
-                                except Exception as e:
-                                    signal_error_log.append({
-                                        "訊號": signal_labels.get(sig, sig), "日期": d,
-                                        "動作": "賣出檢查", "錯誤": str(e),
-                                    })
+                # 圖表顯示範圍維持使用者在「日期設定」設定的 scan_start_date ~ scan_end_date，
+                # 不會因為單日驗證掃描日期(scan_target_date)超出此範圍而被意外撐大。
+                # 週K/月K模式下 full_df.index 是各K棒「最後一個實際交易日」的標籤，用字串比較
+                # 直接篩選即可 (不需要snap；只有精確比對的單日驗證掃描才需要snap)。
+                display_df = full_df[(full_df.index >= scan_start_str) & (full_df.index <= chart_end_str)]
 
-                        remaining_positions = []
+                # 2. 執行區間模擬回測邏輯 (2026-09-03：抽成 run_backtest_simulation() 共用函式，
+                # 詳見函式定義處的說明；這裡只負責準備輸入資料、呼叫函式、與存放結果)
+                full_df_close = full_df["Close"].to_dict()
+                full_df_bias60 = full_df["Bias60"].to_dict() if "Bias60" in full_df.columns else {}
+                full_df_pos = {date: pos for pos, date in enumerate(full_df.index)}
 
-                        for pos in active_positions:
-                            profit_pct = (current_price - pos["buy_price"]) / pos["buy_price"] * 100
-                            sell_reason = None
+                if enable_backtest:
+                    trades, active_positions, max_capital_used, signal_error_log, equity_curve = run_backtest_simulation(
+                        display_df=display_df, full_df=full_df,
+                        full_df_close=full_df_close, full_df_bias60=full_df_bias60, full_df_pos=full_df_pos,
+                        stock_code=stock_code, stock_name=stock_name,
+                        buy_signals=buy_signals, buy_shares_dict=buy_shares_dict, buy_cooldown=buy_cooldown,
+                        sell_signals=sell_signals, enable_take_profit=enable_take_profit,
+                        stop_loss_dict=stop_loss_dict, take_profit_dict=take_profit_dict,
+                        enable_bias60_filter=enable_bias60_filter if buy_signals else False,
+                        max_bias60_buy_pct=max_bias60_buy_pct if buy_signals else 20.0,
+                        enable_min_score_filter=enable_min_score_filter if buy_signals else False,
+                        min_entry_score=min_entry_score if buy_signals else 55.0,
+                        daily_full_df=daily_full_df,
+                    )
+                    # 供下方「參數批次測試(parameter sweep)」重複使用同一份資料，
+                    # 不必重新讀取資料庫/重算指標，只需替換停損/停利/冷卻期參數即可批次回測。
+                    st.session_state.backtest_ctx = {
+                        "display_df": display_df, "full_df": full_df,
+                        "full_df_close": full_df_close, "full_df_bias60": full_df_bias60, "full_df_pos": full_df_pos,
+                        "stock_code": stock_code, "stock_name": stock_name,
+                        "buy_signals": buy_signals, "buy_shares_dict": buy_shares_dict,
+                        "sell_signals": sell_signals, "enable_take_profit": enable_take_profit,
+                        "enable_bias60_filter": enable_bias60_filter if buy_signals else False,
+                        "max_bias60_buy_pct": max_bias60_buy_pct if buy_signals else 20.0,
+                        "enable_min_score_filter": enable_min_score_filter if buy_signals else False,
+                        "min_entry_score": min_entry_score if buy_signals else 55.0,
+                        "daily_full_df": daily_full_df,
+                    }
+                else:
+                    trades, active_positions, max_capital_used, signal_error_log, equity_curve = [], [], 0, [], []
 
-                            eligible_signal = next((sig for sig in triggered_sell_signals if sig != REVERSE_3K_SIGNAL_KEY or profit_pct > REVERSE_3K_MIN_PROFIT_PCT), None)
-
-                            if profit_pct <= -stop_loss_pct:
-                                sell_reason = f"停損出場 ({profit_pct:.1f}%)"
-                            elif enable_take_profit and profit_pct >= take_profit_pct:
-                                sell_reason = f"停利達標 ({profit_pct:.1f}%)"
-                            elif eligible_signal is not None:
-                                sell_reason = f"訊號出場 ({signal_labels.get(eligible_signal, eligible_signal)})"
-
-                            if sell_reason:
-                                pnl = (current_price - pos["buy_price"]) * pos["shares"] * 1000
-                                trades.append({
-                                    "買入日期": pos["buy_date"], "買入理由": pos["signal_label"],
-                                    "進場評分": pos.get("entry_score"), "評分等級": pos.get("entry_grade"),
-                                    "同日觸發訊號": pos.get("entry_signals", ""),
-                                    "買入價": pos["buy_price"], "張數": pos["shares"],
-                                    "賣出日期": d, "賣出理由": sell_reason, "賣出價": current_price,
-                                    "損益(元)": round(pnl), "報酬率(%)": round(profit_pct, 2)
-                                })
-                            else:
-                                remaining_positions.append(pos)
-
-                        active_positions = remaining_positions
-                        # 2026-08-16 修正：原本「當天只要有賣出就直接 continue」，導致同一天
-                        # 停損/停利/訊號出場後，即使當天另有買入訊號觸發，也結構性地不可能同日
-                        # 再進場。改成賣出檢查結束後照常往下走買入檢查，讓同日再進場成為可能；
-                        # 「同訊號再次買入冷卻期」(last_buy_idx/buy_cooldown) 不受影響，仍會正常
-                        # 擋下同一個訊號在冷卻期內的重複買入 (含當天賣出、當天又觸發同訊號的情況)。
-
-                    # --- 買入檢查 ---
-                    if buy_signals:
-                        current_bias60 = full_df_bias60.get(d, 0)
-                        if enable_bias60_filter and pd.notna(current_bias60) and current_bias60 > max_bias60_buy_pct:
-                            pass
-                        else:
-                            # 先跑過今天所有勾選的買入條件，收集「今天實際觸發的訊號」。
-                            # 評分要看的是今天整體訊號共振強度，跟個別訊號是否還在冷卻期無關；
-                            # 冷卻期只決定「要不要真的建倉」，放在後面單獨判斷。
-                            hit_today = []
-                            for sig in buy_signals:
-                                ctx_buy = SignalContext(code=stock_code, name=stock_name, df=full_df, scan_date=d)
-                                try:
-                                    if st.session_state.signal_registry[sig]["func"](ctx_buy).hit:
-                                        hit_today.append(sig)
-                                except Exception as e:
-                                    signal_error_log.append({
-                                        "訊號": signal_labels.get(sig, sig), "日期": d,
-                                        "動作": "買入檢查", "錯誤": str(e),
-                                    })
-
-                            entry_score, entry_grade, entry_signals_text = None, None, ""
-                            if hit_today:
-                                # 2026-08-16 修正：build_score_input() 內部用第三個參數當「在
-                                # full_df 裡的位置」去抓前1天/前20天的收盤價算漲跌幅%與波動率，
-                                # 但這裡原本傳的是 i (在 display_df 裡的位置)。full_df 為了讓
-                                # 指標(MA/KD等)在區間起點就有值，會比 display_df 往前多抓90天
-                                # 緩衝資料，兩邊位置對不上，導致算出來的評分其實是抓到緩衝期
-                                # (跟掃描區間無關的更早日期)的資料，評分本身是錯的，連帶「訊號
-                                # 評分低於門檻不買」這個過濾器也是用錯的數字在判斷。改用
-                                # full_df_pos[d] 取得 d 在 full_df 裡的正確位置。
-                                score_data = build_score_input(full_df, d, full_df_pos[d])
-                                score_labels = [signal_labels.get(s, s) for s in hit_today]
-                                score_kinds = {lbl: "buy" for lbl in score_labels}
-                                entry_score = calc_signal_quality_score(score_data, score_labels, score_kinds)
-                                entry_grade = classify_signal_grade(entry_score)
-                                entry_signals_text = "、".join(score_labels)
-
-                            for sig in hit_today:
-                                if sig in last_buy_idx and (i - last_buy_idx[sig]) <= buy_cooldown: continue
-                                if enable_min_score_filter and entry_score is not None and entry_score < min_entry_score: continue
-
-                                active_positions.append({
-                                    "buy_date": d, "buy_price": current_price, "shares": buy_shares_dict[sig],
-                                    "signal_key": sig, "signal_label": signal_labels.get(sig, sig),
-                                    "entry_score": entry_score, "entry_grade": entry_grade,
-                                    "entry_signals": entry_signals_text,
-                                })
-                                last_buy_idx[sig] = i
-                                current_invested = sum(p["buy_price"] * p["shares"] * 1000 for p in active_positions)
-                                max_capital_used = max(max_capital_used, current_invested)
-
-            st.session_state.run_results = (
-                display_df, results, stock_code, stock_name, scan_target_str,
-                trades, active_positions, enable_backtest, max_capital_used, signal_error_log,
-            )
+                st.session_state.run_results = (
+                    display_df, results, stock_code, stock_name, scan_target_str,
+                    trades, active_positions, enable_backtest, max_capital_used, signal_error_log,
+                    equity_curve, current_kline_timeframe, raw_scan_target_str,
+                )
     except Exception as e:
         st.exception(e)
 
@@ -2034,13 +2411,16 @@ if run_clicked:
 chart_placeholder = st.container()
 with chart_placeholder:
     if st.session_state.run_results is not None:
-        display_df, results, code, name, scan_target_str, trades, active_positions, enable_backtest, max_capital_used, signal_error_log = st.session_state.run_results
+        display_df, results, code, name, scan_target_str, trades, active_positions, enable_backtest, max_capital_used, signal_error_log, equity_curve, run_kline_timeframe, raw_scan_target_str = st.session_state.run_results
 
         _cur_target_str = pd.to_datetime(scan_target_date).strftime("%Y-%m-%d")
-        if code != stock_code or scan_target_str != _cur_target_str:
+        # 2026-09-04：週K/月K模式下 scan_target_str 已被改寫成snap後的K棒標籤日期，不能直接跟
+        # 使用者目前選的日曆日期比較，因此改用未經snap的 raw_scan_target_str 判斷是否過期；
+        # 另外也要偵測「K線週期本身」是否已切換(同一天但週期不同，結果也需要重跑)。
+        if code != stock_code or raw_scan_target_str != _cur_target_str or run_kline_timeframe != current_kline_timeframe:
             st.warning(
-                f"⚠️ 目前顯示的是「{code} / 掃描日期 {scan_target_str}」按下 RUN 當下的結果，"
-                f"與你目前選擇的「{stock_code} / {_cur_target_str}」不同，請重新按下 RUN 以更新圖表與訊號結果。"
+                f"⚠️ 目前顯示的是「{code} / {run_kline_timeframe} / 掃描日期 {scan_target_str}」按下 RUN 當下的結果，"
+                f"與你目前選擇的「{stock_code} / {current_kline_timeframe} / {_cur_target_str}」不同，請重新按下 RUN 以更新圖表與訊號結果。"
             )
 
         fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.02, row_heights=[0.6, 0.18, 0.22])
@@ -2102,6 +2482,14 @@ with chart_placeholder:
             fig.add_hline(y=35, line=dict(color="#27ae60", width=1, dash="dash"), annotation_text="35", annotation_position="right", row=3, col=1)
         fig.update_yaxes(title_text=sub_indicator, row=3, col=1)
 
+        # 2026-09-03：display_dates/display_pos 提前到這裡計算(原本在訊號標記迴圈之後)，
+        # 因為下面統一的「防重疊堆疊計數器」annotation_stack 需要用 display_pos 判斷哪些日期
+        # 算「鄰近」。annotation_stack 由本區塊內全部 4 套標記系統(訊號標記/趨勢線觸發標籤/
+        # B-S標記/交易紀錄菱形)共用，見函式定義處說明。
+        display_dates = display_df.index.tolist()
+        display_pos = {dt: i for i, dt in enumerate(display_dates)}
+        annotation_stack = {}
+
         color_idx = 0
         for key, res in results.items():
             # trendline_breakout / asc_trendline_breakdown 的 marks 是
@@ -2110,34 +2498,42 @@ with chart_placeholder:
             # 繪圖區塊 (見下方)，這裡先跳過避免跑進通用邏輯出錯。
             if key in (TREND_SIGNAL_KEY, ASC_TREND_SIGNAL_KEY): continue
             if not res.hit or not res.marks: continue
-            
+
             label = st.session_state.signal_registry[key]["label"]
-            
-            # 若為賣出訊號，字在K線上方(ay負值)往下指；買入訊號，字在K線下方(ay正值)往上指
+
+            # 若為賣出訊號，字在K線上方往下指；買入訊號，字在K線下方往上指
             if label in SELL_LABELS:
                 color = "#27ae60" # 綠色
                 y_col = "High"
-                ay_dir = -1
+                direction = "up"
             else:
                 color = MARK_COLORS[color_idx % len(MARK_COLORS)]
                 color_idx += 1
                 y_col = "Low"
-                ay_dir = 1
-                
+                direction = "down"
+
             last_idx = len(res.marks) - 1
             for i, d in enumerate(res.marks):
                 if d not in display_df.index: continue
                 is_trigger = (i == last_idx)
-                
-                ay_val = (40 if is_trigger else 22) * ay_dir
-                
-                fig.add_annotation(
-                    x=d, y=display_df.loc[d, y_col], text=label if is_trigger else "", showarrow=True,
-                    arrowhead=2 if is_trigger else 1, arrowcolor=color, font=dict(color=color, size=12),
-                    ax=0, ay=ay_val, row=1, col=1
-                )
 
-        display_dates = display_df.index.tolist()
+                if is_trigger:
+                    # 只有「觸發日」才顯示文字標籤，因此只有它需要納入堆疊計數，
+                    # 統一固定 ax=0，靠 ay 垂直堆疊排整齊。
+                    ay_val = _stacked_ay(annotation_stack, display_pos, d, direction)
+                    fig.add_annotation(
+                        x=d, y=display_df.loc[d, y_col], text=label, showarrow=True,
+                        arrowhead=2, arrowcolor=color, font=dict(color=color, size=12),
+                        ax=0, ay=ay_val, row=1, col=1
+                    )
+                else:
+                    # 非觸發日：只畫小箭頭不顯示文字，不佔用堆疊版位
+                    fig.add_annotation(
+                        x=d, y=display_df.loc[d, y_col], text="", showarrow=True,
+                        arrowhead=1, arrowcolor=color, ax=0,
+                        ay=22 if direction == "down" else -22, row=1, col=1
+                    )
+
         tres = results.get(TREND_SIGNAL_KEY)
         if tres is not None and tres.marks:
             scan_d = None
@@ -2165,7 +2561,7 @@ with chart_placeholder:
                         x=scan_d, y=display_df.loc[scan_d, "Close"],
                         text=style["hit_label"], showarrow=True, arrowhead=2,
                         arrowcolor=style["color"], font=dict(color=style["color"], size=12),
-                        ax=0, ay=30, row=1, col=1,
+                        ax=0, ay=_stacked_ay(annotation_stack, display_pos, scan_d, "down"), row=1, col=1,
                     )
 
         # ===== 上升趨勢線跌破 (asc_trendline_breakdown)：畫出支撐線 + 跌破標籤 =====
@@ -2202,27 +2598,59 @@ with chart_placeholder:
                         x=scan_d, y=display_df.loc[scan_d, "Close"],
                         text=style["hit_label"], showarrow=True, arrowhead=2,
                         arrowcolor=style["color"], font=dict(color=style["color"], size=12),
-                        ax=0, ay=-30, row=1, col=1,
+                        ax=0, ay=_stacked_ay(annotation_stack, display_pos, scan_d, "up"), row=1, col=1,
                     )
 
         if enable_backtest:
+            # 2026-09-03：B/S 標記錨點改為當天 Low(買)/High(賣)，不再用實際成交價當Y座標，
+            # 避免箭頭指向的點剛好落在K線蠟燭實體內部造成重疊、看不清楚。
+            # 同時原本用「日期: 價格」的 dict 會讓同一天第2筆以後的交易直接覆蓋掉第1筆(資料遺失)，
+            # 改成「日期: [價格清單]」，同一天多筆時合併顯示為「B×2」這種形式，不再遺失任何一筆。
+            # ay 一律改用跟其他標記系統共用的 annotation_stack 堆疊計數器(見函式定義處說明)，
+            # 讓 B/S 標記與訊號標記/趨勢線標籤/交易紀錄菱形彼此之間也會互相錯開，不再各畫各的。
             buy_markers = {}
             sell_markers = {}
             for t in trades:
-                if t["買入日期"] not in buy_markers: buy_markers[t["買入日期"]] = t["買入價"]
-                if t["賣出日期"] not in sell_markers: sell_markers[t["賣出日期"]] = t["賣出價"]
+                buy_markers.setdefault(t["買入日期"], []).append(t["買入價"])
+                sell_markers.setdefault(t["賣出日期"], []).append(t["賣出價"])
             for pos in active_positions:
-                if pos["buy_date"] not in buy_markers: buy_markers[pos["buy_date"]] = pos["buy_price"]
-            for d, p in buy_markers.items():
-                fig.add_annotation(x=d, y=p, text="B", showarrow=True, arrowhead=1, arrowcolor="#e74c3c", font=dict(color="white", size=10), bgcolor="#e74c3c", ax=0, ay=30, row=1, col=1)
-            for d, p in sell_markers.items():
-                fig.add_annotation(x=d, y=p, text="S", showarrow=True, arrowhead=1, arrowcolor="#2ecc71", font=dict(color="white", size=10), bgcolor="#2ecc71", ax=0, ay=-30, row=1, col=1)
+                buy_markers.setdefault(pos["buy_date"], []).append(pos["buy_price"])
+            for d, prices in buy_markers.items():
+                if d not in display_df.index: continue
+                text = "B" if len(prices) == 1 else f"B×{len(prices)}"
+                fig.add_annotation(
+                    x=d, y=display_df.loc[d, "Low"], text=text, showarrow=True, arrowhead=1,
+                    arrowcolor="#e74c3c", font=dict(color="white", size=10), bgcolor="#e74c3c",
+                    ax=0, ay=_stacked_ay(annotation_stack, display_pos, d, "down"), row=1, col=1,
+                )
+            for d, prices in sell_markers.items():
+                if d not in display_df.index: continue
+                text = "S" if len(prices) == 1 else f"S×{len(prices)}"
+                fig.add_annotation(
+                    x=d, y=display_df.loc[d, "High"], text=text, showarrow=True, arrowhead=1,
+                    arrowcolor="#2ecc71", font=dict(color="white", size=10), bgcolor="#2ecc71",
+                    ax=0, ay=_stacked_ay(annotation_stack, display_pos, d, "up"), row=1, col=1,
+                )
 
         # ============ 交易紀錄 (Trading Journal) 標記：實際手動交易的買/賣點 ============
         # 用菱形符號區分於上方模擬回測的 B/S 方框標記，避免混淆「模擬」與「實際」交易
-        # 顏色改用藍色系；位移距離加大，避免跟模擬買賣訊號(B/S方框)的位置重疊
+        # 顏色改用藍色系
+        # 2026-09-03：菱形點本身維持在真實成交價(jp)不動 —— 這是使用者實際成交的價格，
+        # 移到Low/High會失真；只調整旁邊的文字標籤，一樣改用共用的 annotation_stack 堆疊計數器，
+        # 讓交易紀錄跟其他 3 套標記系統統一排版；因為交易紀錄是本區塊最後畫的，
+        # 天然會疊在最外層(離K線最遠)，不會蓋住比較靠近價格的訊號/B-S標記。
         journal_df_all = st.session_state.get("journal_log_df", pd.DataFrame(columns=JOURNAL_COLUMNS))
         journal_for_stock = journal_df_all[journal_df_all["股票代碼"].astype(str) == str(code)] if not journal_df_all.empty else journal_df_all
+
+        # 2026-09-04：週K/月K模式下，交易紀錄菱形標記的顯示規則 (使用者指定)——
+        # 週K：只顯示「進出手法」等於「週1K」訊號標籤(訊號模組實際登記的標籤是「周1K」)的紀錄；
+        # 月K：完全不顯示交易紀錄菱形標記。日K模式維持原樣，不受影響。
+        if run_kline_timeframe == "月K":
+            journal_for_stock = journal_for_stock.iloc[0:0]
+        elif run_kline_timeframe == "週K" and not journal_for_stock.empty:
+            _weekly1k_label = signal_labels.get(WEEKLY_1K_SIGNAL_KEY, "周1K")
+            journal_for_stock = journal_for_stock[journal_for_stock["進出手法"] == _weekly1k_label]
+
         if not journal_for_stock.empty:
             for _, jr in journal_for_stock.iterrows():
                 jd = jr["交易日期"]
@@ -2241,9 +2669,13 @@ with chart_placeholder:
                     hovertemplate=f"交易紀錄 [{action}]<br>日期: {jd}<br>價格: {jp}<br>手法: {method}<br>張數: {shares_text}<br>Note: {jr['Note'] if pd.notna(jr['Note']) else ''}<extra></extra>",
                     showlegend=False,
                 ), row=1, col=1)
+
+                direction = "down" if not is_sell else "up"
+                ay_val = _stacked_ay(annotation_stack, display_pos, jd, direction, base=60)
+
                 fig.add_annotation(
                     x=jd, y=jp, text=method, showarrow=True, arrowhead=1, arrowcolor=color,
-                    font=dict(color=color, size=10), ax=0, ay=(75 if not is_sell else -75), row=1, col=1,
+                    font=dict(color=color, size=10), ax=0, ay=ay_val, row=1, col=1,
                 )
 
         # 查價線(垂直十字線)設定：
@@ -2291,11 +2723,11 @@ with chart_placeholder:
 # 下方顯示區塊: 訊號結果 & 回測績效
 # --------------------------------------------------------------------------
 if st.session_state.run_results is not None:
-    display_df, results, code, name, scan_target_str, trades, active_positions, enable_backtest, max_capital_used, signal_error_log = st.session_state.run_results
+    display_df, results, code, name, scan_target_str, trades, active_positions, enable_backtest, max_capital_used, signal_error_log, equity_curve, run_kline_timeframe, raw_scan_target_str = st.session_state.run_results
 
     _cur_target_str2 = pd.to_datetime(scan_target_date).strftime("%Y-%m-%d")
-    if code != stock_code or scan_target_str != _cur_target_str2:
-        st.info(f"⚠️ 以下為「{code} / {scan_target_str}」的舊結果，請按 RUN 更新為目前選擇的「{stock_code} / {_cur_target_str2}」。")
+    if code != stock_code or raw_scan_target_str != _cur_target_str2 or run_kline_timeframe != current_kline_timeframe:
+        st.info(f"⚠️ 以下為「{code} / {run_kline_timeframe} / {scan_target_str}」的舊結果，請按 RUN 更新為目前選擇的「{stock_code} / {current_kline_timeframe} / {_cur_target_str2}」。")
 
     if enable_backtest: col_text, col_backtest = st.columns([1, 2.5])
     else: col_text, col_backtest = st.container(), None
@@ -2332,8 +2764,41 @@ if st.session_state.run_results is not None:
                 m1.metric("已實現總損益", f"{total_pnl:,} 元")
                 m2.metric("交易次數", f"{len(trades)} 次")
                 m3.metric("勝率", f"{win_rate:.1f} %")
-                m4.metric("最大動用資金", f"{round(max_capital_used):,} 元") 
+                m4.metric("最大動用資金", f"{round(max_capital_used):,} 元")
                 m5.metric("總損益百分比", f"{total_pnl_pct:.2f} %")
+
+                # ============ 權益曲線(Equity Curve) + 最大回撤(Max Drawdown) + 平均持有天數 ============
+                # 權益曲線 = 逐日「已實現損益累計 + 未平倉部位未實現損益」，由 run_backtest_simulation()
+                # 逐日計算後回傳；最大回撤 = 權益曲線相對於「當時為止歷史新高」的最大跌幅(取最負值)。
+                equity_df = pd.DataFrame(equity_curve) if equity_curve else pd.DataFrame(columns=["date", "equity"])
+                if not equity_df.empty:
+                    equity_df["歷史新高"] = equity_df["equity"].cummax()
+                    equity_df["回撤"] = equity_df["equity"] - equity_df["歷史新高"]
+                    max_drawdown = equity_df["回撤"].min()
+                else:
+                    max_drawdown = 0
+                avg_holding_days = df_trades["持有天數"].mean() if "持有天數" in df_trades.columns and df_trades["持有天數"].notna().any() else None
+
+                n1, n2 = st.columns(2)
+                n1.metric("最大回撤 (Max Drawdown)", f"{round(max_drawdown):,} 元")
+                n2.metric("平均持有天數", f"{avg_holding_days:.1f} 天" if avg_holding_days is not None and pd.notna(avg_holding_days) else "-")
+
+                if not equity_df.empty:
+                    eq_fig = go.Figure()
+                    eq_fig.add_trace(go.Scatter(
+                        x=equity_df["date"], y=equity_df["equity"], mode="lines",
+                        line=dict(color="#2980b9", width=2), name="權益(累計損益)",
+                    ))
+                    eq_fig.add_trace(go.Scatter(
+                        x=equity_df["date"], y=equity_df["歷史新高"], mode="lines",
+                        line=dict(color="#bdc3c7", width=1, dash="dot"), name="歷史新高",
+                    ))
+                    eq_fig.update_layout(
+                        title="權益曲線 (含未平倉部位未實現損益)", height=260,
+                        margin=dict(t=40, b=20, l=10, r=10), showlegend=True,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    )
+                    st.plotly_chart(eq_fig, use_container_width=True, key=f"equity_curve_chart_{code}_{scan_target_str}")
 
                 if "進場評分" in df_trades.columns and df_trades["進場評分"].notna().any():
                     win_score = df_trades.loc[df_trades["損益(元)"] > 0, "進場評分"].mean()
@@ -2387,7 +2852,17 @@ if st.session_state.run_results is not None:
     journal_df_all = st.session_state.get("journal_log_df", pd.DataFrame(columns=JOURNAL_COLUMNS))
     journal_for_stock = journal_df_all[journal_df_all["股票代碼"].astype(str) == str(code)].copy() if not journal_df_all.empty else journal_df_all
 
-    if journal_for_stock.empty:
+    # 2026-09-04：跟上方K線圖菱形標記同一套規則——週K模式下只拿「進出手法」等於「週1K」訊號
+    # 標籤(訊號模組實際登記的標籤是「周1K」)的紀錄來比對；月K模式完全不比對交易紀錄。
+    if run_kline_timeframe == "月K":
+        journal_for_stock = journal_for_stock.iloc[0:0]
+    elif run_kline_timeframe == "週K" and not journal_for_stock.empty:
+        _weekly1k_label = signal_labels.get(WEEKLY_1K_SIGNAL_KEY, "周1K")
+        journal_for_stock = journal_for_stock[journal_for_stock["進出手法"] == _weekly1k_label]
+
+    if run_kline_timeframe == "月K":
+        st.info("「月K」模式下不進行交易紀錄比對（交易紀錄僅在日K / 週K模式下顯示）。")
+    elif journal_for_stock.empty:
         st.info(f"目前交易紀錄中沒有 {code} 的資料，無法進行比對。可於側邊欄「讀取 交易紀錄」上傳/編輯。")
     elif not enable_backtest or not trades:
         st.info("請先啟用模擬回測功能並產生已平倉交易，才能與交易紀錄比對。")
@@ -2430,3 +2905,108 @@ if st.session_state.run_results is not None:
             diff = j_avg - b_avg
             diff_msg = f"實際交易紀錄平均報酬率較模擬回測{'高' if diff >= 0 else '低'} {abs(diff):.2f} 個百分點"
             st.caption(diff_msg)
+
+
+# --------------------------------------------------------------------------
+# 參數批次測試 (Parameter Sweep) — 2026-09-03 新增
+# 針對「最近一次按下 RUN」所使用的股票/日期區間/買賣訊號設定 (存在 st.session_state.backtest_ctx
+# 裡)，批次測試不同的停損%/停利%/冷卻期天數組合，找出表現較好的參數組合。批次測試時停損/停利
+# 對所有勾選的買入訊號套用同一組數字(不再是每個訊號各自的值)，因為若連個別訊號的停損/停利都
+# 一起排列組合，總組合數會爆炸；冷卻期則仍是全域一個值(原本就是全域設定，非個別訊號)。
+# 重複呼叫的是與「單次執行(RUN)」完全相同的 run_backtest_simulation()，確保批次測試跑出來的
+# 每一組結果，跟你把同樣參數帶回上面 RUN 一次算出來的結果一致。
+# --------------------------------------------------------------------------
+st.markdown("---")
+with st.expander("🧪 參數批次測試 (Parameter Sweep)", expanded=False):
+    st.caption("請先於上方設定好股票、日期區間、買入/賣出訊號後按一次「RUN」，再到這裡設定停損/停利/冷卻期的候選範圍，批次測試哪組參數表現較好。批次測試時，停損%與停利%會套用到所有勾選的買入訊號(不分訊號個別設定)。")
+
+    sw1, sw2, sw3 = st.columns(3)
+    with sw1:
+        st.markdown("**停損 (%) 範圍**")
+        sweep_sl_start = st.number_input("起始", value=5.0, step=1.0, min_value=0.0, key="sweep_sl_start")
+        sweep_sl_end = st.number_input("結束", value=15.0, step=1.0, min_value=0.0, key="sweep_sl_end")
+        sweep_sl_step = st.number_input("間距", value=5.0, step=1.0, min_value=0.5, key="sweep_sl_step")
+    with sw2:
+        st.markdown("**停利 (%) 範圍**")
+        sweep_tp_start = st.number_input("起始", value=5.0, step=1.0, min_value=0.0, key="sweep_tp_start")
+        sweep_tp_end = st.number_input("結束", value=15.0, step=1.0, min_value=0.0, key="sweep_tp_end")
+        sweep_tp_step = st.number_input("間距", value=5.0, step=1.0, min_value=0.5, key="sweep_tp_step")
+    with sw3:
+        st.markdown(f"**冷卻期 ({KLINE_TIMEFRAME_UNIT_LABEL[current_kline_timeframe]}) 範圍**")
+        sweep_cd_start = st.number_input("起始", value=0, step=1, min_value=0, key="sweep_cd_start")
+        sweep_cd_end = st.number_input("結束", value=5, step=1, min_value=0, key="sweep_cd_end")
+        sweep_cd_step = st.number_input("間距", value=5, step=1, min_value=1, key="sweep_cd_step")
+
+    sweep_sort_by = st.radio("結果排序依據", ["總損益(元)", "勝率(%)"], horizontal=True, key="sweep_sort_by")
+    run_sweep_clicked = st.button("🧪 執行批次測試", key="run_param_sweep_btn")
+
+    if run_sweep_clicked:
+        ctx = st.session_state.get("backtest_ctx")
+        if ctx is None or not ctx.get("buy_signals"):
+            st.warning("請先在上方設定買入訊號並按下「RUN」執行過一次模擬回測，才能進行批次測試。")
+        else:
+            def _sweep_frange(start, end, step):
+                vals = []
+                v = float(start)
+                while v <= float(end) + 1e-9:
+                    vals.append(round(v, 2))
+                    v += float(step)
+                return vals if vals else [round(float(start), 2)]
+
+            sl_list = _sweep_frange(sweep_sl_start, sweep_sl_end, sweep_sl_step)
+            tp_list = _sweep_frange(sweep_tp_start, sweep_tp_end, sweep_tp_step)
+            cd_step_int = max(1, int(sweep_cd_step))
+            cd_list = list(range(int(sweep_cd_start), int(sweep_cd_end) + 1, cd_step_int))
+            if not cd_list:
+                cd_list = [int(sweep_cd_start)]
+
+            combos = [(sl, tp, cd) for sl in sl_list for tp in tp_list for cd in cd_list]
+            sweep_progress = st.progress(0.0, text=f"批次測試執行中... (0/{len(combos)})")
+            sweep_rows = []
+
+            for idx, (sl, tp, cd) in enumerate(combos):
+                uniform_sl_dict = {sig: sl for sig in ctx["buy_signals"]}
+                uniform_tp_dict = {sig: tp for sig in ctx["buy_signals"]}
+                s_trades, s_active, s_max_cap, _s_err, s_equity = run_backtest_simulation(
+                    display_df=ctx["display_df"], full_df=ctx["full_df"],
+                    full_df_close=ctx["full_df_close"], full_df_bias60=ctx["full_df_bias60"], full_df_pos=ctx["full_df_pos"],
+                    stock_code=ctx["stock_code"], stock_name=ctx["stock_name"],
+                    buy_signals=ctx["buy_signals"], buy_shares_dict=ctx["buy_shares_dict"], buy_cooldown=cd,
+                    sell_signals=ctx["sell_signals"], enable_take_profit=ctx["enable_take_profit"],
+                    stop_loss_dict=uniform_sl_dict, take_profit_dict=uniform_tp_dict,
+                    enable_bias60_filter=ctx["enable_bias60_filter"], max_bias60_buy_pct=ctx["max_bias60_buy_pct"],
+                    enable_min_score_filter=ctx["enable_min_score_filter"], min_entry_score=ctx["min_entry_score"],
+                    daily_full_df=ctx.get("daily_full_df"),
+                )
+                s_df = pd.DataFrame(s_trades)
+                s_total_pnl = s_df["損益(元)"].sum() if not s_df.empty else 0
+                s_win_rate = (len(s_df[s_df["損益(元)"] > 0]) / len(s_df) * 100) if not s_df.empty else 0
+                s_avg_hold = s_df["持有天數"].mean() if (not s_df.empty and "持有天數" in s_df.columns and s_df["持有天數"].notna().any()) else None
+
+                s_eq_df = pd.DataFrame(s_equity)
+                if not s_eq_df.empty:
+                    s_eq_df["歷史新高"] = s_eq_df["equity"].cummax()
+                    s_max_dd = (s_eq_df["equity"] - s_eq_df["歷史新高"]).min()
+                else:
+                    s_max_dd = 0
+
+                sweep_rows.append({
+                    "停損(%)": sl, "停利(%)": tp, "冷卻期(日)": cd,
+                    "交易次數": len(s_trades), "總損益(元)": round(s_total_pnl), "勝率(%)": round(s_win_rate, 1),
+                    "最大回撤(元)": round(s_max_dd),
+                    "平均持有天數": round(s_avg_hold, 1) if s_avg_hold is not None and pd.notna(s_avg_hold) else None,
+                })
+                sweep_progress.progress((idx + 1) / len(combos), text=f"批次測試執行中... ({idx + 1}/{len(combos)})")
+
+            sweep_progress.empty()
+            sweep_df = pd.DataFrame(sweep_rows)
+            sweep_sort_col = "總損益(元)" if sweep_sort_by == "總損益(元)" else "勝率(%)"
+            sweep_df = sweep_df.sort_values(sweep_sort_col, ascending=False).reset_index(drop=True)
+            st.session_state.param_sweep_result = sweep_df
+            st.session_state.param_sweep_sort_label = sweep_sort_by
+
+    if st.session_state.get("param_sweep_result") is not None:
+        _sweep_result_df = st.session_state.param_sweep_result
+        _sweep_sort_label = st.session_state.get("param_sweep_sort_label", "總損益(元)")
+        st.markdown(f"**批次測試結果** (共 {len(_sweep_result_df)} 組合，依「{_sweep_sort_label}」由高到低排序)")
+        st.dataframe(_sweep_result_df, use_container_width=True, hide_index=True)
