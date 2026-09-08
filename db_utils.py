@@ -5,7 +5,6 @@ twse_ohlcv.db 存取工具
   Date (TEXT, YYYY-MM-DD), Market, SecurityCode, SecurityName,
   Open, High, Low, Close, Volume
 """
-import os
 import sqlite3
 import pandas as pd
 
@@ -36,45 +35,8 @@ def ensure_indexes(conn: sqlite3.Connection) -> None:
         pass
 
 
-def _remove_stale_wal_files(db_path: str) -> None:
-    """刪除跟主資料庫檔案內容對不上的 -wal / -shm 暫存檔 (不是 git 追蹤的檔案，
-    刪掉不會影響已經 commit 進 twse_ohlcv.db 的資料)。"""
-    for suffix in ("-wal", "-shm"):
-        stale_path = db_path + suffix
-        if os.path.exists(stale_path):
-            try:
-                os.remove(stale_path)
-            except OSError:
-                pass
-
-
 def get_connection(db_path: str) -> sqlite3.Connection:
-    """
-    開啟 twse_ohlcv.db 連線。
-
-    2026-08-22 新增容錯：Streamlit Cloud 部署時，容器裡的 twse_ohlcv.db 會因為
-    git pull 換成 repo 裡的新版本，但如果同一個資料夾還殘留著「舊版」寫入時留下的
-    -wal / -shm 暫存檔 (SQLite 在 WAL 模式下寫入會產生的暫存檔，不會被 git 追蹤)，
-    SQLite 打開檔案時會發現主檔案跟這兩個暫存檔的內容對不上，回報
-    "database disk image is malformed"，即使 twse_ohlcv.db 本體其實完全正常。
-    這裡開檔後先用 PRAGMA quick_check 驗證一次，遇到 malformed 就自動清掉這兩個
-    暫存檔並重試一次，通常就能自我修復，不需要手動到 Streamlit Cloud 按 Reboot app。
-    """
     conn = sqlite3.connect(db_path, check_same_thread=False)
-    try:
-        conn.execute("PRAGMA quick_check")
-    except sqlite3.DatabaseError as e:
-        if "malformed" not in str(e).lower():
-            raise
-        try:
-            conn.close()
-        except Exception:
-            pass
-        _remove_stale_wal_files(db_path)
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        # 這次如果還是壞的 (代表主檔案本體真的損毀，不是暫存檔的問題)，
-        # 就讓例外往上拋，讓呼叫端 (Stock simulator 頁面) 顯示明確的錯誤訊息。
-        conn.execute("PRAGMA quick_check")
     ensure_indexes(conn)
     return conn
 
@@ -180,6 +142,21 @@ def save_scan_results(db_path: str, all_signal_rows: list, signal_buckets: dict,
     scan_date: 本次掃描日期 (YYYY-MM-DD)，寫入前會先刪除同一天的舊資料，避免重複寫入。
 
     回傳實際寫入的筆數。若 all_signal_rows 為空，僅清除當天舊資料、不寫入新資料。
+
+    2026-09-08 修正：原本這裡開了 PRAGMA journal_mode=WAL 之後，一路到函式結束都沒有
+    切回 DELETE 模式、也沒有做 checkpoint。journal_mode 是寫在 SQLite 檔案 header 裡、
+    跨連線持續生效的設定——只要這個函式被呼叫過一次，twse_ohlcv.db 這個檔案就會被永久
+    標記成 WAL 模式，之後不管是誰 (包含完全沒設定 PRAGMA 的 update_db.py) 再寫入這顆檔案，
+    都會在 WAL 模式下進行，最新資料因此會分散在主檔案 + twse_ohlcv.db-wal / -shm 這兩個
+    side-car 檔案裡。但 GitHub Actions 排程 commit/push 到 git 時只會提交主檔案，不會一併
+    提交這兩個 side-car 檔案，於是 Streamlit Cloud 每次重新部署做全新 git clone 時，打開
+    的都是一顆「缺角」的 db，SQLite 判定成不合法映像檔，丟出
+    `DatabaseError: database disk image is malformed`（即使出錯的查詢跟 signal_scan_results
+    這張表完全無關，因為 journal_mode 是整顆資料庫檔案共用的設定，不是單一資料表的屬性）。
+    這裡在寫入完成、conn.commit() 之後主動把模式切回 DELETE 並再 commit 一次 (等同做一次
+    checkpoint，把 WAL 內容合併寫回主檔案、清空 -wal/-shm)，確保之後不管是這支掃描器、還是
+    update_db.py 寫入，提交進 git 的永遠是一顆完整、單一檔案就能開啟的 db，不會再讓
+    Stock simulator 端讀到損毀的資料庫。
     """
     import datetime as _dt
 
@@ -236,6 +213,16 @@ def save_scan_results(db_path: str, all_signal_rows: list, signal_buckets: dict,
                 """,
                 records,
             )
+        conn.commit()
+
+        # ------------------------------------------------------------------
+        # 關鍵修正：寫入完成後主動切回 DELETE 模式並再次 commit。
+        # sqlite3 在切換 journal_mode 時會自動做一次 checkpoint，把 -wal 檔案
+        # 裡尚未合併的內容寫回主檔案，寫完後 -wal/-shm 會被清空/移除，之後
+        # git commit 的就只有這顆完整、單一檔案就能開啟的 twse_ohlcv.db。
+        # 千萬不要拿掉這兩行，否則 WAL 模式又會被永久留在檔案裡，重蹈覆轍。
+        # ------------------------------------------------------------------
+        conn.execute("PRAGMA journal_mode=DELETE;")
         conn.commit()
 
     return len(records)
