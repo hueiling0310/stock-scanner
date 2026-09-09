@@ -3,14 +3,14 @@ name: Auto Update TWSE OHLCV DB
 on:
   schedule:
     - cron: '17 9,13 * * 1-5'
-  workflow_dispatch: 
+  workflow_dispatch:
 
 jobs:
   update-db:
     runs-on: ubuntu-latest
     permissions:
-      contents: write 
-      
+      contents: write
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -31,6 +31,20 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python update_db.py
 
+      # ====================================================================
+      # 2026-09-09 新增：推出去之前先把資料庫正規化 + 驗證完整性
+      # ====================================================================
+      # Stock simulator 一直出現「database disk image is malformed」，根因是
+      # 這顆 db 曾被切換成 WAL 模式 (資料分散在主檔案 + -wal/-shm side-car)，
+      # 但這個 workflow 只會 git add 主檔案，side-car 不可能跟著進 git，
+      # 於是 Streamlit Cloud 拉到的是一顆「缺角」的資料庫。
+      #
+      # normalize_db.py 會：checkpoint 回主檔案 → 切回 delete 模式 →
+      # 跑 integrity_check → 確認沒有殘留 side-car。任何一項不過就以非 0 結束，
+      # 讓這個 job 直接失敗，壞掉的 db 就不會被推到這裡與另外兩個 repo。
+      - name: Normalize and verify DB before commit
+        run: python normalize_db.py twse_ohlcv.db
+
       - name: Commit and push DB changes to CURRENT repo
         run: |
           git config --global user.name 'github-actions[bot]'
@@ -41,7 +55,7 @@ jobs:
       - name: Push DB to stock-monitor-FUBON and precompute trendlines
         env:
           TARGET_REPO_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
-          TARGET_REPO: "hueiling0310/stock-monitor-FUBON" 
+          TARGET_REPO: "hueiling0310/stock-monitor-FUBON"
           TARGET_BRANCH: "main" # 若該專案的預設分支是 master，請改成 master
         run: |
           mkdir -p target_repo_1
@@ -56,7 +70,7 @@ jobs:
       - name: Push DB to henglunlin-stock-monitor-FUBAN + precompute trendline levels
         env:
           TARGET_REPO_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
-          TARGET_REPO: "hueiling0310/stock-monitor-FUBON" 
+          TARGET_REPO: "hueiling0310/stock-monitor-FUBON"
           TARGET_BRANCH: "main" # 若該專案的預設分支是 master，請改成 master
           # precompute_trendlines.py 需要這兩個才能推播 Telegram 通知，跟上面「Run update script」用同一組
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -77,9 +91,11 @@ jobs:
           if [ -f "precompute_trendlines.py" ]; then
             pip install --quiet pandas requests
             python precompute_trendlines.py || echo "::warning::precompute_trendlines.py 執行失敗，本次略過 trendline_levels.json 更新"
-          else
-            echo "::warning::target_repo_2 找不到 precompute_trendlines.py，略過下降趨勢線預先計算"
           fi
+
+          # precompute_trendlines.py 也會開啟這顆 db，這裡再驗證一次，
+          # 確保推進 monitor repo 的同樣是一顆乾淨、單一檔案就可讀的資料庫。
+          python ../normalize_db.py twse_ohlcv.db
 
           git add twse_ohlcv.db
           if [ -f trendline_levels.json ]; then

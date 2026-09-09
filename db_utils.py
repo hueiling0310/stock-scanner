@@ -4,9 +4,154 @@ twse_ohlcv.db 存取工具
 資料表 ohlcv_data 欄位:
   Date (TEXT, YYYY-MM-DD), Market, SecurityCode, SecurityName,
   Open, High, Low, Close, Volume
+
+============================================================================
+2026-09-09 重大修正：全面停用 WAL 模式 + 開啟連線時自動修復
+============================================================================
+症狀：只要 twse_ohlcv.db 被更新過一次，Stock simulator 就會在
+      db_utils.get_stock_list() 丟出「database disk image is malformed」。
+
+真正原因 (實測驗證過)：
+  1. 掃描器的 save_scan_results()、模擬器的 save_to_database() 都會執行
+     `PRAGMA journal_mode=WAL;`。WAL 是寫在 db 檔案 header 裡、跨連線持續
+     生效的持久設定，一旦設定就會一直是 WAL，直到有人明確改回來。
+  2. 之前加的「寫完再切回 DELETE」補救其實**無效**：SQLite 規定只有在
+     「整個資料庫沒有任何其他連線」時才能切出 WAL 模式。但 Streamlit 頁面
+     一開始就用 db_utils.get_connection() 建立了一條常駐讀取連線，所以切換
+     一定會撞上 `database is locked`，模式繼續留在 WAL，
+     twse_ohlcv.db-wal / -shm 這兩個 side-car 檔案也一直存在。
+  3. GitHub Actions 的 update.yml 只做 `git add twse_ohlcv.db`，side-car
+     檔案不會、也不可能跟著進 git。
+  4. Streamlit Cloud 拉到新版主檔案後，搭配到對不上的 WAL 狀態，SQLite 判定
+     成不合法映像檔 → database disk image is malformed。
+
+修正方向：
+  * 這顆 db 是「要進 git、被多個 repo 與多個部署環境共用的單一檔案」，
+    WAL 的側寫檔天生無法跟著 git 走，所以這裡**完全不再啟用 WAL**，
+    一律使用預設的 rollback journal (delete) 模式，確保任何時刻
+    twse_ohlcv.db 都是自己一個檔案就完整可讀。
+  * 寫入端改用 timeout 等待鎖定，並在 finally 明確 close()，
+    不再依賴 `with sqlite3.connect(...)`（那只會 commit，不會關閉連線）。
+  * get_connection() 加上「開啟時自我修復」：若因為殘留的 side-car 導致
+    資料庫讀不開，會自動清掉這些殘留檔再重試一次，讓 app 不會整頁掛掉。
+============================================================================
 """
+import os
 import sqlite3
+
 import pandas as pd
+
+
+# --------------------------------------------------------------------------
+# 連線與自我修復
+# --------------------------------------------------------------------------
+def _sidecar_paths(db_path: str):
+    """回傳這顆資料庫可能產生的 WAL side-car 檔案路徑 (-wal / -shm)。"""
+    return [f"{db_path}-wal", f"{db_path}-shm"]
+
+
+def _probe(conn: sqlite3.Connection) -> None:
+    """對連線做一次極輕量的探測查詢。
+
+    刻意不用 `PRAGMA integrity_check` / `quick_check`——那兩個是 O(檔案大小)
+    的全表掃描，這顆 db 有數十 MB，Streamlit 每次 rerun 都跑會明顯拖慢。
+    讀 sqlite_master 只碰到檔案開頭的幾個 page，成本接近零，但只要檔案 header
+    或 WAL 狀態不一致 (也就是 malformed 的情況)，這一行就會立刻丟出
+    sqlite3.DatabaseError，足以當作健康檢查。
+    """
+    conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+
+
+def _remove_sidecars(db_path: str) -> list:
+    """刪除殘留的 -wal / -shm，回傳實際刪掉的檔名清單。"""
+    removed = []
+    for path in _sidecar_paths(db_path):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                removed.append(os.path.basename(path))
+        except OSError:
+            pass
+    return removed
+
+
+def _clear_stale_sidecars(db_path: str) -> None:
+    """在開啟連線「之前」處理殘留的 WAL side-car 檔案。
+
+    為什麼要用 mtime 判斷「過期」：
+      Streamlit Cloud 上的 twse_ohlcv.db 是由 git 更新的——GitHub Actions 更新
+      完資料庫後 push，Streamlit 端 git pull 就把「主檔案」整個換成新版，但留在
+      容器磁碟上的 twse_ohlcv.db-wal / -shm 不會、也不可能跟著 git 一起更新。
+      這時候 -shm 裡的索引描述的還是「舊主檔案」的頁面配置，SQLite 依它去讀新的
+      主檔案，輕則默默讀到整批舊資料 (實測過：新版有 3000 檔卻只讀到舊的 400 檔)，
+      重則直接判定成 database disk image is malformed——這就是「只要更新資料庫
+      就報錯」的真正機制。
+
+      「主檔案的 mtime 比 -wal 還新」正是這個情境的特徵 (git 覆蓋主檔案時會更新
+      它的 mtime，而 -wal 停留在更早以前)，用它來辨識過期的 side-car 很準確，
+      也不會誤傷「正在寫入中」的正常 WAL (那種情況 -wal 一定比主檔案新)。
+
+    刪掉而不是 checkpoint 回主檔案，是刻意的：過期 side-car 裡裝的是「舊版主檔案」
+    的頁面，把它寫回剛拉下來的新主檔案只會真的把檔案弄壞。這個專案的資料權威來源
+    是 git 上的主檔案，容器磁碟上的 side-car 一律視為可丟棄的殘留物。
+    """
+    wal_path = f"{db_path}-wal"
+    if not (os.path.exists(wal_path) or os.path.exists(f"{db_path}-shm")):
+        return
+    try:
+        db_mtime = os.path.getmtime(db_path)
+        wal_mtime = os.path.getmtime(wal_path) if os.path.exists(wal_path) else 0.0
+    except OSError:
+        return
+    if db_mtime > wal_mtime:
+        _remove_sidecars(db_path)
+
+
+def _normalize_journal_mode(conn: sqlite3.Connection) -> None:
+    """若這顆檔案還停留在 WAL 模式，嘗試把它切回 delete 模式。
+
+    切換只有在「沒有其他連線」時才會成功，失敗時 SQLite 會丟 database is locked
+    或直接回傳現有模式——這裡一律吞掉例外、不影響主流程：切不掉沒關係，
+    真正保證安全的是「所有寫入端都不再主動啟用 WAL」這件事，
+    這個函式只是順手把歷史遺留下來的 WAL 檔案救回正常模式。
+    """
+    try:
+        mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+        if str(mode).lower() == "wal":
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            conn.execute("PRAGMA journal_mode=DELETE;")
+            conn.commit()
+    except sqlite3.Error:
+        pass
+
+
+def get_connection(db_path: str) -> sqlite3.Connection:
+    """建立資料庫連線，並自動處理 git 更新資料庫後殘留的 WAL side-car。
+
+    三層保護 (由前到後)：
+      1. 開啟前先清掉「過期」的 -wal/-shm (見 _clear_stale_sidecars 說明)，
+         這一層擋掉「更新資料庫後讀到舊資料 / malformed」的主要情境。
+      2. 開啟後做一次極輕量的探測查詢；若仍讀不開，清掉 side-car 再重試一次。
+      3. 連線成功後順手把殘留的 WAL 模式切回 delete，避免再產生新的 side-car。
+    """
+    _clear_stale_sidecars(db_path)
+
+    conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
+    try:
+        _probe(conn)
+    except sqlite3.DatabaseError:
+        # 讀不開 → 不管 mtime 如何，一律清掉 side-car 後重試
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+        _remove_sidecars(db_path)
+        conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
+        _probe(conn)  # 這次再失敗就讓它往外丟，代表主檔案本身真的壞了
+
+    _normalize_journal_mode(conn)
+    ensure_indexes(conn)
+    return conn
 
 
 def ensure_indexes(conn: sqlite3.Connection) -> None:
@@ -33,12 +178,6 @@ def ensure_indexes(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         # 資料表尚未建立時 (例如全新空白 db) 略過，等資料寫入後下次連線再補建索引即可
         pass
-
-
-def get_connection(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    ensure_indexes(conn)
-    return conn
 
 
 def get_stock_list(conn: sqlite3.Connection) -> pd.DataFrame:
@@ -143,20 +282,11 @@ def save_scan_results(db_path: str, all_signal_rows: list, signal_buckets: dict,
 
     回傳實際寫入的筆數。若 all_signal_rows 為空，僅清除當天舊資料、不寫入新資料。
 
-    2026-09-08 修正：原本這裡開了 PRAGMA journal_mode=WAL 之後，一路到函式結束都沒有
-    切回 DELETE 模式、也沒有做 checkpoint。journal_mode 是寫在 SQLite 檔案 header 裡、
-    跨連線持續生效的設定——只要這個函式被呼叫過一次，twse_ohlcv.db 這個檔案就會被永久
-    標記成 WAL 模式，之後不管是誰 (包含完全沒設定 PRAGMA 的 update_db.py) 再寫入這顆檔案，
-    都會在 WAL 模式下進行，最新資料因此會分散在主檔案 + twse_ohlcv.db-wal / -shm 這兩個
-    side-car 檔案裡。但 GitHub Actions 排程 commit/push 到 git 時只會提交主檔案，不會一併
-    提交這兩個 side-car 檔案，於是 Streamlit Cloud 每次重新部署做全新 git clone 時，打開
-    的都是一顆「缺角」的 db，SQLite 判定成不合法映像檔，丟出
-    `DatabaseError: database disk image is malformed`（即使出錯的查詢跟 signal_scan_results
-    這張表完全無關，因為 journal_mode 是整顆資料庫檔案共用的設定，不是單一資料表的屬性）。
-    這裡在寫入完成、conn.commit() 之後主動把模式切回 DELETE 並再 commit 一次 (等同做一次
-    checkpoint，把 WAL 內容合併寫回主檔案、清空 -wal/-shm)，確保之後不管是這支掃描器、還是
-    update_db.py 寫入，提交進 git 的永遠是一顆完整、單一檔案就能開啟的 db，不會再讓
-    Stock simulator 端讀到損毀的資料庫。
+    2026-09-09 修正：這裡原本會執行 `PRAGMA journal_mode=WAL;`，這是整個
+    「database disk image is malformed」問題的源頭 (詳見檔案最上方的說明)。
+    現在完全不再啟用 WAL，改用 timeout 等待鎖定 + 單一交易批次寫入，
+    並在 finally 明確 close() 連線 (原本的 `with sqlite3.connect(...)` 只會
+    commit、不會關閉連線，連線會一直開著直到被 GC 回收)。
     """
     import datetime as _dt
 
@@ -198,8 +328,11 @@ def save_scan_results(db_path: str, all_signal_rows: list, signal_buckets: dict,
             now_str,
         ))
 
-    with sqlite3.connect(db_path, timeout=30.0) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
+    # 注意：這裡刻意「不」設定 journal_mode=WAL。維持 SQLite 預設的 rollback
+    # journal，寫入期間產生的 -journal 暫存檔在交易結束後會自動刪除，
+    # 不會像 WAL 那樣留下持久的 -wal/-shm，也不會把 WAL 模式烙印進檔案 header。
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    try:
         ensure_scan_results_table(conn)
         # 先刪除當天舊資料再寫入，避免同一天重複掃描時資料重複累積
         conn.execute("DELETE FROM signal_scan_results WHERE scan_date = ?", (scan_date,))
@@ -214,16 +347,8 @@ def save_scan_results(db_path: str, all_signal_rows: list, signal_buckets: dict,
                 records,
             )
         conn.commit()
-
-        # ------------------------------------------------------------------
-        # 關鍵修正：寫入完成後主動切回 DELETE 模式並再次 commit。
-        # sqlite3 在切換 journal_mode 時會自動做一次 checkpoint，把 -wal 檔案
-        # 裡尚未合併的內容寫回主檔案，寫完後 -wal/-shm 會被清空/移除，之後
-        # git commit 的就只有這顆完整、單一檔案就能開啟的 twse_ohlcv.db。
-        # 千萬不要拿掉這兩行，否則 WAL 模式又會被永久留在檔案裡，重蹈覆轍。
-        # ------------------------------------------------------------------
-        conn.execute("PRAGMA journal_mode=DELETE;")
-        conn.commit()
+    finally:
+        conn.close()
 
     return len(records)
 
