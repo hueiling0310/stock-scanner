@@ -2033,7 +2033,7 @@ def _default_browse_scan_date():
     return datetime.today().date()
 
 
-st.markdown("### 📋 Sotck Simulator")
+st.markdown("### 📋 Stock Simulator")
 
 with st.expander("展開瀏覽掃描結果", expanded=False):
     sel_col1, sel_col3, sel_col4, btn_col1, btn_col2 = st.columns([1, 1.6, 1.8, 0.9, 0.9])
