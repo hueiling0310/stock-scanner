@@ -84,7 +84,15 @@ DEFAULT_JOURNAL_PATH = os.path.join(_REPO_ROOT_DIR, "Trading Journal.xlsx")
 # 之後改表想套用新設定，側邊欄按「🔄 重新載入訊號開關表」即可，不用重啟程式。
 DEFAULT_SIGNAL_CONTROL_TABLE_PATH = os.path.join(_REPO_ROOT_DIR, "signal_module_controltable.xlsx")
 JOURNAL_LOG_SHEET = "log"
-JOURNAL_COLUMNS = ["交易日期", "股票代碼", "股票名稱", "進出場價格", "買賣方向", "進出手法", "買賣張數", "Note"]
+JOURNAL_COLUMNS = ["交易日期", "股票代碼", "股票名稱", "進出場價格", "買賣方向", "進出手法", "買賣張數", "零股(股)", "Note"]
+
+# 台股交易單位：1 張 = 1000 股。
+# 2026-09-10 新增零股紀錄功能：交易紀錄改用「買賣張數 + 零股(股)」兩個欄位一起表示數量，
+# 總股數 = 買賣張數 × 1000 + 零股(股)。例如買 2 張又 300 股就填「2」和「300」。
+# 之所以不把「買賣張數」直接改成可填小數 (300股=0.3張)，是因為零股本來就是用「股」在想的，
+# 換算成小數容易填錯；也不改成單一「買賣股數」欄位，是為了讓既有紀錄完全不用改動——
+# 舊資料沒有「零股(股)」這一欄，讀進來會是空值，一律視為 0 股，數量跟以前完全一樣。
+SHARES_PER_LOT = 1000
 JOURNAL_ACTIONS = ["買入", "賣出"]
 JOURNAL_FONT_NAME = "微軟正黑體"
 JOURNAL_FONT_SIZE = 11
@@ -380,6 +388,71 @@ def resolve_journal_action(row) -> str:
     return classify_journal_action(row.get("進出手法") if hasattr(row, "get") else "")
 
 
+def _journal_qty_field(row, key: str) -> float:
+    """取出交易紀錄某個數量欄位的數值，空白/非數字/負數一律視為 0。"""
+    try:
+        value = row.get(key) if hasattr(row, "get") else None
+        value = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if value != value or value <= 0:  # NaN 或 <=0
+        return 0.0
+    return value
+
+
+def journal_has_qty(row) -> bool:
+    """這筆紀錄有沒有實際填寫數量 (張數或零股至少填了一個)。"""
+    return (_journal_qty_field(row, "買賣張數") + _journal_qty_field(row, "零股(股)")) > 0
+
+
+def journal_row_shares(row) -> float:
+    """把一筆交易紀錄的「買賣張數」+「零股(股)」換算成總股數 (台股 1 張 = 1000 股)。
+
+    兩個欄位都沒填時，沿用這個功能加入之前的舊行為：以 1 張 (= 1000 股) 計算，
+    這樣既有那些只填手法、沒填張數的舊紀錄，配對結果不會因為這次改版而改變。
+    """
+    total = _journal_qty_field(row, "買賣張數") * SHARES_PER_LOT + _journal_qty_field(row, "零股(股)")
+    return total if total > 0 else float(SHARES_PER_LOT)
+
+
+def format_shares(shares) -> str:
+    """把股數格式化成台股習慣的寫法：2300 股 → 「2張300股」、2000 股 → 「2張」、300 股 → 「300股」。"""
+    if shares is None:
+        return "-"
+    try:
+        shares = float(shares)
+    except (TypeError, ValueError):
+        return "-"
+    if shares != shares or shares <= 0:
+        return "0股"
+    lots, odd = divmod(int(round(shares)), SHARES_PER_LOT)
+    if lots and odd:
+        return f"{lots}張{odd}股"
+    if lots:
+        return f"{lots}張"
+    return f"{odd}股"
+
+
+def normalize_odd_lots(df: pd.DataFrame) -> pd.DataFrame:
+    """把「零股(股)」欄位 ≥ 1000 的部分進位到「買賣張數」，維持零股欄永遠是 0~999。
+
+    編輯器的欄位設定已經限制零股最多 999，但使用者可能是從 Excel 直接貼上整欄資料
+    (貼上不會經過 max_value 檢查)，或是把整張的股數 (例如 2000) 誤填在零股欄。
+    這裡在存檔前統一進位，避免「2張」跟「0張2000股」兩種寫法在紀錄裡混著出現。
+    """
+    if df.empty:
+        return df
+    out = df.copy()
+    lots = pd.to_numeric(out["買賣張數"], errors="coerce").fillna(0)
+    odd = pd.to_numeric(out["零股(股)"], errors="coerce").fillna(0)
+    carry = (odd // SHARES_PER_LOT).astype(int)
+    has_carry = carry > 0
+    if has_carry.any():
+        out.loc[has_carry, "買賣張數"] = (lots + carry)[has_carry]
+        out.loc[has_carry, "零股(股)"] = (odd % SHARES_PER_LOT)[has_carry]
+    return out
+
+
 def load_journal_log(path: str) -> pd.DataFrame:
     """讀取交易紀錄 Excel 的 log 分頁，若檔案不存在或分頁不存在則回傳空表"""
     if not path or not os.path.exists(path):
@@ -394,6 +467,10 @@ def load_journal_log(path: str) -> pd.DataFrame:
     df = df[JOURNAL_COLUMNS].copy()
     df["交易日期"] = pd.to_datetime(df["交易日期"], errors="coerce").dt.strftime("%Y-%m-%d")
     df["買賣張數"] = pd.to_numeric(df["買賣張數"], errors="coerce")
+    # 「零股(股)」是 2026-09-10 新增的欄位。這個欄位加入之前建立的舊 Excel 沒有這一欄，
+    # 上面的 for 迴圈會先補成 None，這裡轉成數值後即為 NaN，計算數量時一律當作 0 股，
+    # 所以舊紀錄的數量與配對結果完全不受影響。
+    df["零股(股)"] = pd.to_numeric(df["零股(股)"], errors="coerce")
     # 「買賣方向」是 2026-08-28 新增的獨立方向欄位，取代原本純靠「進出手法」文字猜測買/賣的
     # 做法。既有 (這個欄位加入之前) 的舊紀錄、或這欄被清空的紀錄，用 classify_journal_action()
     # 自動回填一個預設值，使用者仍可在交易紀錄編輯器裡自行修正回填錯誤的筆數。
@@ -405,16 +482,23 @@ def load_journal_log(path: str) -> pd.DataFrame:
 
 
 def match_journal_trades_fifo(journal_for_stock: pd.DataFrame, latest_price):
-    """對單一股票的交易紀錄做「張數感知的 FIFO 配對」，回傳 (配對後的交易 list, 異常警告 list)。
+    """對單一股票的交易紀錄做「數量感知的 FIFO 配對」，回傳 (配對後的交易 list, 異常警告 list)。
 
-    每一筆買入視為一個持倉批次 (帶「剩餘張數」)，依日期排序後加入佇列尾端；遇到賣出時，
-    用賣出張數依先進先出、逐批扣減佇列最前面買入批次的剩餘張數，每扣一批就產生一筆
-    「已平倉」紀錄 (買入張數=賣出張數=實際成交的那部分)，該批買入剩餘張數歸零才會從佇列
+    每一筆買入視為一個持倉批次 (帶「剩餘股數」)，依日期排序後加入佇列尾端；遇到賣出時，
+    用賣出股數依先進先出、逐批扣減佇列最前面買入批次的剩餘股數，每扣一批就產生一筆
+    「已平倉」紀錄 (買入數量=賣出數量=實際成交的那部分)，該批買入剩餘股數歸零才會從佇列
     移除，否則留在佇列繼續等下一筆賣出配對；一筆賣出可能跨多筆買入批次。迴圈跑完後，
-    佇列裡還有剩餘張數的批次一律視為「未平倉」，用 latest_price 計算未實現報酬率
-    (latest_price 為 None 時只標未平倉、不算報酬率)。「賣出張數超過目前持有張數」時
-    (理論上不該發生，除非紀錄本身缺漏買入或張數填錯) 不會硬湊配對產生假資料，
-    改成回傳一則警告文字讓呼叫端顯示提醒。"""
+    佇列裡還有剩餘股數的批次一律視為「未平倉」，用 latest_price 計算未實現報酬率
+    (latest_price 為 None 時只標未平倉、不算報酬率)。「賣出股數超過目前持有股數」時
+    (理論上不該發生，除非紀錄本身缺漏買入或數量填錯) 不會硬湊配對產生假資料，
+    改成回傳一則警告文字讓呼叫端顯示提醒。
+
+    2026-09-10 零股支援：內部一律換算成「股」來配對 (journal_row_shares)，不再用「張」。
+    改用股當單位，零股才能跟整張一起精確扣抵——例如買 1 張、賣 300 股，剩下的 700 股會
+    正確留在佇列裡算未平倉；如果還用張當單位就得處理 0.3 張這種小數，容易累積浮點誤差。
+    輸出的「買入數量」「賣出數量」是給人看的文字 (format_shares，例如「2張300股」)，
+    另外保留「買入股數」「賣出股數」兩個數值欄位供需要計算的地方使用。
+    """
     if journal_for_stock.empty:
         return [], []
 
@@ -422,17 +506,9 @@ def match_journal_trades_fifo(journal_for_stock: pd.DataFrame, latest_price):
     journal_sorted["交易日期_dt"] = pd.to_datetime(journal_sorted["交易日期"], errors="coerce")
     journal_sorted = journal_sorted.sort_values("交易日期_dt")
 
-    def _shares(row):
-        v = row.get("買賣張數")
-        try:
-            v = float(v)
-            if v > 0:
-                return v
-        except Exception:
-            pass
-        return 1.0  # 未填寫張數時，比對預設以 1 張計算
+    eps = 1e-6  # 股數的比較容差 (股數實務上都是整數，這個容差只是避免浮點誤差)
 
-    buy_queue = []  # 每筆: {"buy_date", "buy_method", "buy_price", "remaining"}
+    buy_queue = []  # 每筆: {"buy_date", "buy_method", "buy_price", "remaining"(股)}
     closed_trades = []
     warnings = []
 
@@ -441,43 +517,44 @@ def match_journal_trades_fifo(journal_for_stock: pd.DataFrame, latest_price):
         if action == "買入":
             buy_queue.append({
                 "buy_date": jr["交易日期"], "buy_method": jr["進出手法"],
-                "buy_price": float(jr["進出場價格"]), "remaining": _shares(jr),
+                "buy_price": float(jr["進出場價格"]), "remaining": journal_row_shares(jr),
             })
         elif action == "賣出":
-            sell_remaining = _shares(jr)
+            sell_remaining = journal_row_shares(jr)
             sell_price = float(jr["進出場價格"])
             if not buy_queue:
-                warnings.append(f"{jr['交易日期']} 賣出 {sell_remaining:g} 張，但目前沒有可配對的買入紀錄（可能漏登買入，或這筆賣出本身填錯）。")
+                warnings.append(f"{jr['交易日期']} 賣出 {format_shares(sell_remaining)}，但目前沒有可配對的買入紀錄（可能漏登買入，或這筆賣出本身填錯）。")
                 continue
-            while sell_remaining > 1e-9 and buy_queue:
+            while sell_remaining > eps and buy_queue:
                 batch = buy_queue[0]
                 matched = min(sell_remaining, batch["remaining"])
                 pnl_pct = (sell_price - batch["buy_price"]) / batch["buy_price"] * 100 if batch["buy_price"] else 0
                 closed_trades.append({
                     "買入日期": batch["buy_date"], "買入手法": batch["buy_method"],
-                    "買入張數": round(matched, 4), "買入價": batch["buy_price"],
+                    "買入數量": format_shares(matched), "買入股數": round(matched, 4), "買入價": batch["buy_price"],
                     "賣出日期": jr["交易日期"], "賣出手法": jr["進出手法"],
-                    "賣出張數": round(matched, 4), "賣出價": sell_price,
+                    "賣出數量": format_shares(matched), "賣出股數": round(matched, 4), "賣出價": sell_price,
                     "狀態": "已平倉", "報酬率(%)": round(pnl_pct, 2),
                 })
                 batch["remaining"] -= matched
                 sell_remaining -= matched
-                if batch["remaining"] <= 1e-9:
+                if batch["remaining"] <= eps:
                     buy_queue.pop(0)
-            if sell_remaining > 1e-9:
-                warnings.append(f"{jr['交易日期']} 賣出張數超過目前持有張數，還有 {sell_remaining:g} 張賣出紀錄配對不到買入（可能漏登買入，或張數填錯）。")
+            if sell_remaining > eps:
+                warnings.append(f"{jr['交易日期']} 賣出股數超過目前持有股數，還有 {format_shares(sell_remaining)} 的賣出紀錄配對不到買入（可能漏登買入，或數量填錯）。")
 
     open_trades = []
     for batch in buy_queue:
-        if batch["remaining"] <= 1e-9:
+        if batch["remaining"] <= eps:
             continue
         pnl_pct = None
         if latest_price is not None and batch["buy_price"]:
             pnl_pct = round((latest_price - batch["buy_price"]) / batch["buy_price"] * 100, 2)
         open_trades.append({
             "買入日期": batch["buy_date"], "買入手法": batch["buy_method"],
-            "買入張數": round(batch["remaining"], 4), "買入價": batch["buy_price"],
-            "賣出日期": "-", "賣出手法": "-", "賣出張數": None, "賣出價": None,
+            "買入數量": format_shares(batch["remaining"]), "買入股數": round(batch["remaining"], 4),
+            "買入價": batch["buy_price"],
+            "賣出日期": "-", "賣出手法": "-", "賣出數量": "-", "賣出股數": None, "賣出價": None,
             "狀態": "未平倉", "報酬率(%)": pnl_pct,
         })
 
@@ -601,6 +678,7 @@ def journal_editor_dialog():
     for _col in ["股票代碼", "股票名稱", "買賣方向", "進出手法", "Note"]:
         edit_source[_col] = edit_source[_col].astype("string")
     edit_source["買賣張數"] = pd.to_numeric(edit_source["買賣張數"], errors="coerce")
+    edit_source["零股(股)"] = pd.to_numeric(edit_source["零股(股)"], errors="coerce")
     # 這裡刻意 .astype(float)：如果目前紀錄裡的價格剛好都是整數 (例如 100、250)，
     # pd.to_numeric() 會把整欄自動推斷成 int64，Streamlit 的 data_editor 會依照
     # 欄位的 pandas dtype 決定編輯格子能不能輸入小數，即使 NumberColumn 有設定
@@ -619,14 +697,34 @@ def journal_editor_dialog():
             "進出場價格": st.column_config.NumberColumn("進出場價格", format="%.2f", step=0.01),
             "買賣方向": st.column_config.SelectboxColumn("買賣方向", options=JOURNAL_ACTIONS, required=True),
             "進出手法": st.column_config.SelectboxColumn("進出手法 (清單選擇，上方可新增自訂選項)", options=method_options),
-            "買賣張數": st.column_config.NumberColumn("買賣張數", format="%d", min_value=0, step=1),
+            "買賣張數": st.column_config.NumberColumn(
+                "買賣張數 (整張)", format="%d", min_value=0, step=1,
+                help="整張的部分，1 張 = 1000 股。只買零股時這裡填 0。",
+            ),
+            "零股(股)": st.column_config.NumberColumn(
+                "零股 (股)", format="%d", min_value=0, max_value=999, step=1,
+                help="不足 1 張的零股股數，填 0~999。例如買 2 張又 300 股，張數填 2、零股填 300。",
+            ),
             "Note": st.column_config.TextColumn("Note"),
         },
+    )
+
+    st.caption(
+        "💡 數量填法：台股 1 張 = 1000 股。整張填在「買賣張數」、不足一張的填在「零股」(0~999)，"
+        "總股數 = 張數 × 1000 + 零股。例如 2 張又 300 股 → 張數 2、零股 300；只買 500 股零股 → 張數 0、零股 500。"
+        "兩欄都留空的舊紀錄，仍會沿用原本「以 1 張計算」的行為。"
     )
 
     # 依「股票代碼」欄位自動帶入對應的「股票名稱」
     if not edited_df.empty:
         edited_df["股票名稱"] = edited_df["股票代碼"].map(code_to_name).fillna(edited_df["股票名稱"])
+
+    # 零股欄若被貼上 ≥1000 的數字 (從 Excel 整欄貼上不會經過 max_value 檢查)，先進位成張數再提示，
+    # 避免「2張」與「0張2000股」兩種寫法混在同一份紀錄裡。
+    if not edited_df.empty:
+        _odd_over = pd.to_numeric(edited_df["零股(股)"], errors="coerce").fillna(0) >= SHARES_PER_LOT
+        if _odd_over.any():
+            st.info(f"ℹ️ 有 {int(_odd_over.sum())} 筆紀錄的零股填了 1000 股以上，儲存時會自動進位成整張（例如 2000 股 → 2 張 0 股）。")
 
     col_save, col_cancel = st.columns(2)
     with col_save:
@@ -648,6 +746,8 @@ def journal_editor_dialog():
     if save_clicked or force_save_clicked:
         save_df = edited_df.copy()
         save_df["交易日期"] = pd.to_datetime(save_df["交易日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+        # 存檔前把零股 ≥1000 的部分進位到張數，讓零股欄永遠維持 0~999
+        save_df = normalize_odd_lots(save_df)
         save_target_path = st.session_state.get("journal_path", DEFAULT_JOURNAL_PATH)
         try:
             save_journal_log(save_target_path, save_df)
@@ -745,8 +845,8 @@ def journal_summary_dialog():
         return
 
     df_all = pd.DataFrame(all_trades)
-    df_all = df_all[["股票代碼", "股票名稱", "買入日期", "買入手法", "買入張數", "買入價",
-                      "賣出日期", "賣出手法", "賣出張數", "賣出價", "狀態", "報酬率(%)"]]
+    df_all = df_all[["股票代碼", "股票名稱", "買入日期", "買入手法", "買入數量", "買入價",
+                      "賣出日期", "賣出手法", "賣出數量", "賣出價", "狀態", "報酬率(%)"]]
 
     n_closed = int((df_all["狀態"] == "已平倉").sum())
     n_open = int((df_all["狀態"] == "未平倉").sum())
@@ -2658,15 +2758,16 @@ with chart_placeholder:
                     continue
                 jp = jr["進出場價格"]
                 method = jr["進出手法"] if pd.notna(jr["進出手法"]) else ""
-                shares = jr["買賣張數"] if pd.notna(jr["買賣張數"]) else None
-                shares_text = f"{shares:g} 張" if shares is not None else "未填"
+                # 數量改用「張數 + 零股」合併換算後的股數顯示 (例如「2張300股」)，
+                # 兩個欄位都沒填的舊紀錄維持顯示「未填」，不要誤導成真的買了 1 張。
+                shares_text = format_shares(journal_row_shares(jr)) if journal_has_qty(jr) else "未填"
                 action = resolve_journal_action(jr)
                 is_sell = action == "賣出"
                 color = "#1565c0" if not is_sell else "#00acc1"  # 買入: 深藍 / 賣出: 藍綠(同屬藍色系但可區分方向)
                 fig.add_trace(go.Scatter(
                     x=[jd], y=[jp], mode="markers", marker=dict(symbol="diamond", size=11, color=color, line=dict(color="white", width=1)),
                     name=f"交易紀錄({action})",
-                    hovertemplate=f"交易紀錄 [{action}]<br>日期: {jd}<br>價格: {jp}<br>手法: {method}<br>張數: {shares_text}<br>Note: {jr['Note'] if pd.notna(jr['Note']) else ''}<extra></extra>",
+                    hovertemplate=f"交易紀錄 [{action}]<br>日期: {jd}<br>價格: {jp}<br>手法: {method}<br>數量: {shares_text}<br>Note: {jr['Note'] if pd.notna(jr['Note']) else ''}<extra></extra>",
                     showlegend=False,
                 ), row=1, col=1)
 
@@ -2881,7 +2982,7 @@ if st.session_state.run_results is not None:
             st.info("交易紀錄中尚無可比對的買入紀錄。")
         else:
             df_journal_trades = pd.DataFrame(journal_trades)
-            df_journal_trades = df_journal_trades[["買入日期", "買入手法", "買入張數", "買入價", "賣出日期", "賣出手法", "賣出張數", "賣出價", "狀態", "報酬率(%)"]]
+            df_journal_trades = df_journal_trades[["買入日期", "買入手法", "買入數量", "買入價", "賣出日期", "賣出手法", "賣出數量", "賣出價", "狀態", "報酬率(%)"]]
             df_backtest_trades = pd.DataFrame(trades)
             n_open = (df_journal_trades["狀態"] == "未平倉").sum()
             n_closed = (df_journal_trades["狀態"] == "已平倉").sum()
